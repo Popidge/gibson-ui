@@ -14,6 +14,12 @@ Use the built-in Bash terminal or file navigator. The 3D view follows your journ
 
 GIBSON targets [Omarchy](https://omarchy.org/) first. It also runs on other Arch Linux Wayland desktops.
 
+## Video demo
+
+[![Watch the 45-second GIBSON demo](https://i.ytimg.com/vi/5sH-IbS19-Q/maxresdefault.jpg)](https://www.youtube.com/watch?v=5sH-IbS19-Q)
+
+[Watch the 45-second demo on YouTube.](https://www.youtube.com/watch?v=5sH-IbS19-Q)
+
 ## Install
 
 The AUR package is ready, but new AUR account registrations are temporarily closed.
