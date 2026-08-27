@@ -20,6 +20,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --yes libasound2-dev libwayland-dev libxkbcommon-dev
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Test
         run: cargo test --frozen --all-features
       - name: Check style
