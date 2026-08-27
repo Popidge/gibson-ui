@@ -42,11 +42,10 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Enter the file system")]
+#[command(version, about = "Travel through the file system as a cinematic city")]
 struct Args {
     /// Directory to show and use as the shell working directory.
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    path: Option<PathBuf>,
 
     /// Open the top level of the machine.
     #[arg(long)]
@@ -56,7 +55,7 @@ struct Args {
     #[arg(long)]
     fullscreen: bool,
 
-    /// Open on the next empty Hyprland workspace in fullscreen cockpit mode.
+    /// Start fullscreen and use an empty Hyprland workspace when available.
     #[arg(long)]
     cockpit: bool,
 
@@ -110,6 +109,8 @@ fn main() -> anyhow::Result<()> {
         PathBuf::from("/")
     } else {
         args.path
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."))
     };
     let root = requested
         .canonicalize()

@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-#[cfg(feature = "mixkit-audio")]
+#[cfg(has_mixkit_audio)]
 macro_rules! sound_asset {
     ($name:literal) => {
         include_bytes!(concat!(
@@ -18,7 +18,7 @@ macro_rules! sound_asset {
         ))
     };
 }
-#[cfg(not(feature = "mixkit-audio"))]
+#[cfg(not(has_mixkit_audio))]
 macro_rules! sound_asset {
     ($name:literal) => {
         include_bytes!(concat!(
@@ -282,9 +282,9 @@ mod tests {
             assert!(!decode_static(bytes).unwrap().frames.is_empty());
         }
         let music = StreamingSoundData::from_cursor(Cursor::new(MUSIC)).unwrap();
-        #[cfg(feature = "mixkit-audio")]
+        #[cfg(has_mixkit_audio)]
         assert!(music.duration() > Duration::from_secs(210));
-        #[cfg(not(feature = "mixkit-audio"))]
+        #[cfg(not(has_mixkit_audio))]
         assert!(music.duration() > Duration::from_secs(20));
     }
 

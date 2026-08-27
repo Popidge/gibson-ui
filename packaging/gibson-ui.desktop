@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=GIBSON
+GenericName=File-system Visualiser
+Comment=Travel through the file system as a cinematic city
+Exec=gibson-ui
+Icon=gibson-ui
+Terminal=false
+Categories=System;FileTools;
+Keywords=filesystem;terminal;visualiser;Omarchy;Hackers;
+StartupNotify=false
+Actions=Cockpit;
+
+[Desktop Action Cockpit]
+Name=Open Cockpit Mode
+Exec=gibson-ui --cockpit

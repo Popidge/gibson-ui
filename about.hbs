@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GIBSON third-party licences</title>
+  <style>
+    body { background: #071020; color: #d8ffff; font: 16px sans-serif; margin: 2rem; }
+    main { margin: auto; max-width: 70rem; }
+    a { color: #53f6ff; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border-bottom: 1px solid #245466; padding: .5rem; text-align: left; }
+    pre { background: #020814; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>GIBSON third-party licences</h1>
+  <p>This file lists the Rust packages linked into the GIBSON binary.</p>
+  <table>
+    <thead><tr><th>Package</th><th>Version</th><th>Licence</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      <tr>
+        <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+    {{/each}}
+    </tbody>
+  </table>
+  <h2>Licence texts</h2>
+  {{#each overview}}
+    <h3 id="{{id}}">{{name}}</h3>
+    <pre>{{text}}</pre>
+  {{/each}}
+</main>
+</body>
+</html>

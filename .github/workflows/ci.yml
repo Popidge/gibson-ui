@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev libwayland-dev libxkbcommon-dev
+      - name: Test
+        run: cargo test --frozen --all-features
+      - name: Check style
+        run: cargo clippy --frozen --all-targets --all-features -- -D warnings
+      - name: Build public release
+        run: cargo build --frozen --release

@@ -608,15 +608,15 @@ mod tests {
     #[test]
     fn unrelated_index_work_does_not_rebuild_the_visible_city() {
         assert!(affects_visible_city(
-            Path::new("/home/jamie/dev"),
-            Path::new("/home/jamie/dev/project")
+            Path::new("/home/user/dev"),
+            Path::new("/home/user/dev/project")
         ));
         assert!(affects_visible_city(
-            Path::new("/home/jamie/dev"),
-            Path::new("/home/jamie/music")
+            Path::new("/home/user/dev"),
+            Path::new("/home/user/music")
         ));
         assert!(!affects_visible_city(
-            Path::new("/home/jamie/dev"),
+            Path::new("/home/user/dev"),
             Path::new("/usr/share")
         ));
     }

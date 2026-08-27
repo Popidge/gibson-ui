@@ -1,0 +1,32 @@
+# Maintainer: Jamie Taylor <j.taylor.1990 at gmail dot com>
+
+pkgname=gibson-ui-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Cinematic 3D file-system visualiser for Omarchy and Wayland'
+arch=('x86_64')
+url='https://github.com/Popidge/gibson-ui'
+license=('MIT')
+depends=('alsa-lib' 'bash' 'glibc' 'libgcc' 'libxkbcommon' 'vulkan-icd-loader' 'wayland' 'xdg-utils')
+optdepends=(
+  'foot: import the terminal font and colour settings'
+  'hyprland: move cockpit mode to an empty workspace'
+  'omarchy: use the current palette and background'
+)
+provides=("gibson-ui=$pkgver")
+conflicts=('gibson-ui')
+options=('!debug')
+source_x86_64=("gibson-ui-$pkgver-x86_64.tar.zst::$url/releases/download/v$pkgver/gibson-ui-$pkgver-x86_64.tar.zst")
+sha256sums_x86_64=('8381e0c474555325004fcaffb8522df86ef43e3158654d135760093955d9209e')
+
+package() {
+  local release_dir="$srcdir/gibson-ui-$pkgver-$CARCH"
+
+  install -Dm755 "$release_dir/gibson-ui" "$pkgdir/usr/bin/gibson-ui"
+  install -Dm644 "$release_dir/gibson-ui.desktop" "$pkgdir/usr/share/applications/gibson-ui.desktop"
+  install -Dm644 "$release_dir/gibson-ui.png" "$pkgdir/usr/share/pixmaps/gibson-ui.png"
+  install -Dm644 "$release_dir/gibson-ui.1" "$pkgdir/usr/share/man/man1/gibson-ui.1"
+  install -Dm644 "$release_dir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$release_dir/THIRD_PARTY.md" "$pkgdir/usr/share/doc/$pkgname/THIRD_PARTY.md"
+  install -Dm644 "$release_dir/THIRD_PARTY_LICENSES.html" "$pkgdir/usr/share/doc/$pkgname/THIRD_PARTY_LICENSES.html"
+}

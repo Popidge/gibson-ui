@@ -14,4 +14,6 @@ Build the release binary with the private soundscape:
 cargo build --frozen --release --features mixkit-audio
 ```
 
+The feature uses fallback audio when the private files are incomplete. The release script requires every private file.
+
 Do not commit the Mixkit WAV or OGG files.

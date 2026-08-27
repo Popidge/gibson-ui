@@ -1,0 +1,83 @@
+.TH GIBSON-UI 1 "August 2026" "GIBSON 0.1.0" "User Commands"
+.SH NAME
+gibson-ui \- travel through the file system as a cinematic city
+.SH SYNOPSIS
+.B gibson-ui
+.RI [ options ]
+.RI [ directory ]
+.SH DESCRIPTION
+GIBSON is a native Wayland file-system visualiser.
+It contains a Bash terminal and a file navigator.
+Directory changes move the camera through a city of directory towers.
+.PP
+GIBSON uses the Omarchy palette and background when they are available.
+It uses a built-in palette on other Wayland systems.
+.SH OPTIONS
+.TP
+.B --root
+Start at the top-level directory.
+.TP
+.B --fullscreen
+Start in borderless fullscreen mode.
+.TP
+.B --cockpit
+Move to an empty Hyprland workspace and start in fullscreen mode.
+On other compositors, this option starts in fullscreen mode only.
+.TP
+.BI --fps " NUMBER"
+Set the application limit to 30, 60, or 120 frames per second.
+.TP
+.B --uncapped
+Remove the application frame limit.
+.TP
+.B --perf
+Write renderer statistics to the application log every two seconds.
+.TP
+.B -h, --help
+Show command help.
+.TP
+.B -V, --version
+Show the version.
+.SH CONTROLS
+.TP
+.B F2
+Change between terminal and file-navigator control.
+.TP
+.B F3
+Show or hide the terminal pane.
+.TP
+.B F4
+Show or hide the file navigator.
+.TP
+.B F10
+Open or close settings.
+.TP
+.B F11
+Change the fullscreen state.
+.TP
+.B Left, Right, R
+Orbit left, orbit right, or reset the orbit.
+.TP
+.B Up, Down, Page Up, Page Down, Home, End
+Move through the file navigator.
+.TP
+.B Enter
+Enter a directory or open a file with the default application.
+.TP
+.B Backspace
+Move to the parent directory.
+.SH FILES
+.TP
+.I ~/.config/gibson/gibson.toml
+User settings.
+.TP
+.I ~/.local/state/omarchy/current/theme/colors.toml
+Optional live Omarchy palette.
+.TP
+.I ~/.local/state/omarchy/current/background
+Optional live Omarchy background.
+.SH SEE ALSO
+.BR bash (1),
+.BR foot (1),
+.BR hyprctl (1),
+.BR xdg-open (1)
