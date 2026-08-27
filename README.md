@@ -2,9 +2,9 @@
 
 ![GIBSON filesystem city](assets/images/gibson-banner.png)
 
-"...i'm in this computer, right, so i'm looking around, i'm lookin' around, yknow, throwin' commands at it, i don't know where it is or what it does or anything... it's like-it's like *choice*, **it's just beautiful**..."
-
-	- **Joey Pardella** *(as played by Jesse Bradford)*, *Hackers* (1995)
+> "...i'm in this computer, right, so i'm looking around, i'm lookin' around, yknow, throwin' commands at it, i don't know where it is or what it does or anything... it's like-it's like *choice*, **it's just beautiful**..."
+>
+> — **Joey Pardella** *(as played by Jesse Bradford)*, *Hackers* (1995)
 
 GIBSON turns directory changes into cinematic flights through a file-system city.
 
