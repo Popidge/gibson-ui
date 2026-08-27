@@ -1,0 +1,24 @@
+# Rust output
+/target/
+
+# Private licensed sound sources and release encodes
+/assets/sounds/*.wav
+/assets/sounds/encoded/
+
+# Arch package output
+/packaging/aur/pkg/
+/packaging/aur/src/
+/packaging/aur/*.pkg.tar.*
+
+# Release output and local diagnostics
+/dist/
+*.log
+core
+core.*
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
