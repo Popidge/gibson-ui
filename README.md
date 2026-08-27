@@ -16,13 +16,18 @@ GIBSON targets [Omarchy](https://omarchy.org/) first. It also runs on other Arch
 
 ## Install
 
-Install the official binary package from the AUR:
+The AUR package is ready, but new AUR account registrations are temporarily closed.
+
+Install the current release with the included Arch package recipe:
 
 ```bash
-yay -S gibson-ui-bin
+sudo pacman -S --needed base-devel git
+git clone --depth 1 https://github.com/Popidge/gibson-ui.git
+cd gibson-ui/packaging/aur
+makepkg -si
 ```
 
-You can use another AUR helper instead of `yay`.
+AUR publication is planned when new account registrations are available again.
 
 Open **GIBSON** from your desktop launcher. The launcher also provides a **Cockpit mode** action.
 
