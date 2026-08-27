@@ -2,6 +2,10 @@
 
 This project uses [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Added tower lightning that responds to live CPU and scheduler load.
+
 ## 0.1.0 - 2026-08-27
 
 - Added the native `wgpu` file-system city visualiser.

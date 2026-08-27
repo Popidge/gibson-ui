@@ -43,6 +43,24 @@ impl GraphicsQuality {
         }
     }
 
+    pub fn lightning_arcs(self) -> usize {
+        match self {
+            Self::Performance => 1,
+            Self::Balanced => 2,
+            Self::High => 3,
+            Self::Cinematic => 5,
+        }
+    }
+
+    pub fn lightning_segments(self) -> usize {
+        match self {
+            Self::Performance => 5,
+            Self::Balanced => 7,
+            Self::High => 9,
+            Self::Cinematic => 11,
+        }
+    }
+
     fn adjust(self, direction: isize) -> Self {
         const VALUES: [GraphicsQuality; 4] = [
             GraphicsQuality::Performance,
@@ -133,6 +151,7 @@ pub struct GraphicsSettings {
     pub quality: GraphicsQuality,
     pub frame_rate: FrameRate,
     pub floor_pulses: bool,
+    pub system_lightning: bool,
     pub scanlines: bool,
     pub motion_scale: f32,
     pub performance_log: bool,
@@ -144,6 +163,7 @@ impl Default for GraphicsSettings {
             quality: GraphicsQuality::High,
             frame_rate: FrameRate::Fps60,
             floor_pulses: true,
+            system_lightning: true,
             scanlines: true,
             motion_scale: 1.0,
             performance_log: false,
@@ -269,6 +289,7 @@ enum SettingItem {
     GraphicsQuality,
     FrameRate,
     FloorPulses,
+    SystemLightning,
     Scanlines,
     Motion,
     PerformanceLog,
@@ -279,12 +300,13 @@ enum SettingItem {
 }
 
 impl SettingsMenu {
-    const OMARCHY_ITEMS: [SettingItem; 12] = [
+    const OMARCHY_ITEMS: [SettingItem; 13] = [
         SettingItem::FollowOmarchy,
         SettingItem::Backdrop,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
+        SettingItem::SystemLightning,
         SettingItem::Scanlines,
         SettingItem::Motion,
         SettingItem::PerformanceLog,
@@ -293,11 +315,12 @@ impl SettingsMenu {
         SettingItem::Audio,
         SettingItem::AudioVolume,
     ];
-    const PORTABLE_ITEMS: [SettingItem; 11] = [
+    const PORTABLE_ITEMS: [SettingItem; 12] = [
         SettingItem::Backdrop,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
+        SettingItem::SystemLightning,
         SettingItem::Scanlines,
         SettingItem::Motion,
         SettingItem::PerformanceLog,
@@ -362,6 +385,7 @@ impl SettingsMenu {
                     self.settings.graphics.frame_rate.adjust(direction)
             }
             SettingItem::FloorPulses => self.settings.graphics.floor_pulses ^= true,
+            SettingItem::SystemLightning => self.settings.graphics.system_lightning ^= true,
             SettingItem::Scanlines => self.settings.graphics.scanlines ^= true,
             SettingItem::Motion => {
                 self.settings.graphics.motion_scale = stepped(
@@ -431,6 +455,10 @@ impl SettingsMenu {
             SettingItem::FloorPulses => (
                 "FLOOR PULSES",
                 on_off(self.settings.graphics.floor_pulses).to_owned(),
+            ),
+            SettingItem::SystemLightning => (
+                "SYSTEM LIGHTNING",
+                on_off(self.settings.graphics.system_lightning).to_owned(),
             ),
             SettingItem::Scanlines => (
                 "SCANLINES",
@@ -514,6 +542,20 @@ mod tests {
         assert!(menu.adjust(1));
         assert_eq!(menu.settings.graphics.frame_rate, FrameRate::Fps120);
         assert!(menu.snapshot().text.contains("▶ FRAME RATE"));
+    }
+
+    #[test]
+    fn system_lightning_can_be_disabled() {
+        let mut menu = SettingsMenu::new(Settings::default(), true);
+        menu.move_selection(5);
+
+        assert!(menu.adjust(1));
+        assert!(!menu.settings.graphics.system_lightning);
+        assert!(
+            menu.snapshot()
+                .text
+                .contains("▶ SYSTEM LIGHTNING       OFF")
+        );
     }
 
     #[test]

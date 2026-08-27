@@ -107,6 +107,7 @@ The settings screen uses Up and Down for selection. Use Left and Right to change
 - Uses complete directory routes for terminal changes.
 - Keeps the same city route in both directions.
 - Shows effects for create, remove, rename, move, and modify events.
+- Maps live system load to lightning that climbs the directory towers.
 - Plays an ambient score, flight sounds, and navigator feedback.
 - Fades all audio when the application loses focus.
 - Provides wide cockpit and compact drawer layouts.
@@ -119,6 +120,8 @@ The file navigator does not change file-system data. Use the terminal for write 
 ## Settings
 
 Press `F10` to change graphics, motion, audio, theme, and frame-rate settings.
+
+System lightning uses CPU activity and the Linux load average. Higher load creates more frequent and complex arcs.
 
 GIBSON stores changed settings in `$XDG_CONFIG_HOME/gibson/gibson.toml`.
 

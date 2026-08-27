@@ -12,6 +12,7 @@ const MAX_VISIBLE_STOREYS: usize = 72;
 const MAX_CONNECTIONS: usize = 96;
 const MAX_TOWER_LABELS: usize = 32;
 const FILE_EFFECT_TIME: Duration = Duration::from_millis(1_100);
+const LIGHTNING_CYCLE: Duration = Duration::from_millis(620);
 pub const MAX_RENDER_OBJECTS: usize = 960;
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,7 @@ struct Tower {
     height: f32,
     width: f32,
     readable: bool,
+    lightning_seed: u32,
     born: Instant,
     updated: Instant,
 }
@@ -36,6 +38,38 @@ struct Tower {
 pub struct RenderObject {
     pub model: Mat4,
     pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LightningOptions {
+    pub load: f32,
+    pub max_arcs: usize,
+    pub segments: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SceneRenderContext {
+    pub now: Instant,
+    pub state: VisualState,
+    pub camera_eye: Vec3,
+    pub camera_focus: Vec3,
+    pub max_objects: usize,
+    pub lightning: LightningOptions,
+}
+
+impl LightningOptions {
+    pub const OFF: Self = Self {
+        load: 0.0,
+        max_arcs: 0,
+        segments: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LightningAnimation {
+    travel: f32,
+    envelope: f32,
+    seed: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +237,7 @@ fn position_key(position: Vec3) -> (u32, u32, u32) {
 }
 
 pub struct Scene {
+    started: Instant,
     root: PathBuf,
     towers: HashMap<PathBuf, Tower>,
     tower_order: Vec<PathBuf>,
@@ -218,6 +253,7 @@ impl Scene {
         let now = Instant::now();
         let initial_focus = Vec3::new(0.0, 1.8, 0.0);
         let mut scene = Self {
+            started: now,
             root: root.clone(),
             towers: HashMap::new(),
             tower_order: Vec::new(),
@@ -470,14 +506,21 @@ impl Scene {
 
     pub fn write_render_objects(
         &self,
-        now: Instant,
-        state: VisualState,
-        camera_eye: Vec3,
-        camera_focus: Vec3,
-        max_objects: usize,
+        context: SceneRenderContext,
         objects: &mut Vec<RenderObject>,
     ) {
-        let max_objects = max_objects.clamp(64, MAX_RENDER_OBJECTS);
+        let context = SceneRenderContext {
+            max_objects: context.max_objects.clamp(64, MAX_RENDER_OBJECTS),
+            ..context
+        };
+        let SceneRenderContext {
+            now,
+            state,
+            camera_eye,
+            camera_focus,
+            max_objects,
+            ..
+        } = context;
         let current_path = &self.root;
         let current_position = self
             .towers
@@ -549,6 +592,7 @@ impl Scene {
                 }
             }
         }
+        self.add_system_lightning(objects, context);
         for path in &self.tower_order {
             if objects.len() >= max_objects || path == current_path {
                 continue;
@@ -729,6 +773,7 @@ impl Scene {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "/".into());
         let label = compact_label(&name, 22);
+        let lightning_seed = path_seed(&path);
         self.tower_order.push(path.clone());
         self.towers.insert(
             path.clone(),
@@ -745,10 +790,78 @@ impl Scene {
                 height: 3.6,
                 width: 1.65,
                 readable: true,
+                lightning_seed,
                 born: now,
                 updated: now,
             },
         );
+    }
+
+    fn add_system_lightning(&self, objects: &mut Vec<RenderObject>, context: SceneRenderContext) {
+        let SceneRenderContext {
+            now,
+            state,
+            camera_eye,
+            camera_focus,
+            max_objects,
+            lightning: options,
+        } = context;
+        if options.max_arcs == 0 || options.segments < 2 || self.tower_order.is_empty() {
+            return;
+        }
+        let elapsed = now.duration_since(self.started);
+        let cycle_seconds = LIGHTNING_CYCLE.as_secs_f32();
+        let epoch = (elapsed.as_secs_f32() / cycle_seconds).floor() as u32;
+        let phase = (elapsed.as_secs_f32() / cycle_seconds).fract();
+        let load = options.load.clamp(0.0, 1.0);
+        let event_seed = mix_seed(epoch ^ 0xa7c3_19d5);
+        if random_unit(event_seed) > 0.06 + load * 0.88 || phase >= 0.68 {
+            return;
+        }
+
+        let envelope = (std::f32::consts::PI * phase / 0.68).sin().max(0.0).sqrt();
+        let arc_count = 1 + (load * options.max_arcs.saturating_sub(1) as f32).round() as usize;
+        let start = event_seed as usize % self.tower_order.len();
+        let shape_tick = (phase * 7.0).floor() as u32;
+        let mut added = 0;
+        for offset in 0..self.tower_order.len() {
+            if added >= arc_count.min(options.max_arcs) || objects.len() >= max_objects {
+                break;
+            }
+            let path = &self.tower_order[(start + offset) % self.tower_order.len()];
+            if path == &self.root {
+                continue;
+            }
+            let Some(tower) = self
+                .towers
+                .get(path)
+                .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
+            else {
+                continue;
+            };
+            add_tower_lightning(
+                objects,
+                tower,
+                camera_eye,
+                options,
+                lightning_animation(tower, epoch, shape_tick, phase, envelope),
+                max_objects,
+            );
+            added += 1;
+        }
+        if added < arc_count.min(options.max_arcs)
+            && objects.len() < max_objects
+            && let Some(tower) = self.towers.get(&self.root)
+        {
+            add_tower_lightning(
+                objects,
+                tower,
+                camera_eye,
+                options,
+                lightning_animation(tower, epoch, shape_tick, phase, envelope),
+                max_objects,
+            );
+        }
     }
 
     fn focus_target(&self) -> Vec3 {
@@ -1012,6 +1125,154 @@ fn add_connection(
     }
 }
 
+fn add_tower_lightning(
+    objects: &mut Vec<RenderObject>,
+    tower: &Tower,
+    camera_eye: Vec3,
+    options: LightningOptions,
+    animation: LightningAnimation,
+    max_objects: usize,
+) {
+    let LightningOptions { load, segments, .. } = options;
+    let LightningAnimation {
+        travel,
+        envelope,
+        seed,
+    } = animation;
+    let camera_delta = camera_eye - tower.position;
+    let normal = if camera_delta.x.abs() >= camera_delta.z.abs() {
+        Vec3::X * nonzero_sign(camera_delta.x)
+    } else {
+        Vec3::Z * nonzero_sign(camera_delta.z)
+    };
+    let tangent = Vec3::new(-normal.z, 0.0, normal.x);
+    let width = tower_width(tower);
+    let height = tower_height(tower);
+    let low = height * (0.06 + random_unit(seed.rotate_left(3)) * 0.22);
+    let high = height * (0.72 + random_unit(seed.rotate_left(9)) * 0.23);
+    let rising = seed & 1 == 0;
+    let (start_y, end_y) = if rising { (low, high) } else { (high, low) };
+    let center_offset = (random_unit(seed.rotate_left(15)) - 0.5) * width * 0.25;
+    let surface = tower.position + normal * (width * 0.51 + 0.045);
+    let color = if seed & 2 == 0 {
+        [0.86, 0.98, 1.0]
+    } else {
+        [1.0, 0.08, 0.68]
+    };
+    let thickness = 0.032 + load * 0.038;
+    let mut previous = surface + tangent * center_offset + Vec3::Y * start_y;
+
+    for index in 1..=segments {
+        if objects.len() >= max_objects {
+            break;
+        }
+        let t = index as f32 / segments as f32;
+        let point_seed = mix_seed(seed ^ (index as u32).wrapping_mul(0x9e37_79b9));
+        let zigzag = (random_unit(point_seed) - 0.5)
+            * width
+            * (0.38 + load * 0.24)
+            * (std::f32::consts::PI * t).sin();
+        let point = surface
+            + tangent * (center_offset + zigzag)
+            + Vec3::Y * (start_y + (end_y - start_y) * t);
+        let head = (1.0 - ((t - travel).abs() / 0.32).min(1.0)).powi(2);
+        add_lightning_segment(
+            objects,
+            previous,
+            point,
+            thickness * (1.0 + head * 0.45),
+            [
+                color[0],
+                color[1],
+                color[2],
+                envelope * (6.5 + load * 4.0 + head * 4.0),
+            ],
+        );
+
+        if load > 0.42 && index % 3 == (seed as usize % 3) && objects.len() < max_objects {
+            let fork_seed = mix_seed(point_seed ^ 0xd1b5_4a35);
+            let side = if fork_seed & 1 == 0 { -1.0 } else { 1.0 };
+            let vertical = if rising { 1.0 } else { -1.0 };
+            let fork = point
+                + tangent * side * width * (0.12 + random_unit(fork_seed) * 0.18)
+                + normal * 0.025
+                + Vec3::Y
+                    * vertical
+                    * height
+                    * (0.025 + random_unit(fork_seed.rotate_left(7)) * 0.035);
+            add_lightning_segment(
+                objects,
+                point,
+                fork,
+                thickness * 0.62,
+                [color[0], color[1], color[2], envelope * (5.2 + load * 3.0)],
+            );
+        }
+        previous = point;
+    }
+}
+
+fn lightning_animation(
+    tower: &Tower,
+    epoch: u32,
+    shape_tick: u32,
+    phase: f32,
+    envelope: f32,
+) -> LightningAnimation {
+    LightningAnimation {
+        travel: phase / 0.68,
+        envelope,
+        seed: mix_seed(tower.lightning_seed ^ epoch.rotate_left(11) ^ shape_tick),
+    }
+}
+
+fn add_lightning_segment(
+    objects: &mut Vec<RenderObject>,
+    from: Vec3,
+    to: Vec3,
+    thickness: f32,
+    color: [f32; 4],
+) {
+    let delta = to - from;
+    let length = delta.length();
+    if length <= 0.001 {
+        return;
+    }
+    objects.push(RenderObject {
+        model: Mat4::from_scale_rotation_translation(
+            Vec3::new(thickness, length, thickness),
+            Quat::from_rotation_arc(Vec3::Y, delta / length),
+            (from + to) * 0.5,
+        ),
+        color,
+    });
+}
+
+fn path_seed(path: &Path) -> u32 {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0x811c_9dc5, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        })
+}
+
+fn mix_seed(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^ (value >> 16)
+}
+
+fn random_unit(seed: u32) -> f32 {
+    mix_seed(seed) as f32 / u32::MAX as f32
+}
+
+fn nonzero_sign(value: f32) -> f32 {
+    if value < 0.0 { -1.0 } else { 1.0 }
+}
+
 fn camera_subject(tower: &Tower, animated_center: Option<Vec3>) -> CameraSubject {
     let height = tower_height(tower);
     let width = tower_width(tower);
@@ -1259,6 +1520,49 @@ mod tests {
 
         assert!(top > next);
         assert!(next > bottom);
+    }
+
+    #[test]
+    fn lightning_is_bounded_and_placed_on_the_camera_facing_surface() {
+        let scene = Scene::new(PathBuf::from("/tmp/gibson-lightning-test"));
+        let tower = &scene.towers[&scene.root];
+        let mut objects = Vec::new();
+        add_tower_lightning(
+            &mut objects,
+            tower,
+            Vec3::new(10.0, 4.0, 0.0),
+            LightningOptions {
+                load: 0.8,
+                max_arcs: 3,
+                segments: 9,
+            },
+            LightningAnimation {
+                travel: 0.5,
+                envelope: 1.0,
+                seed: 42,
+            },
+            10,
+        );
+
+        assert_eq!(objects.len(), 10);
+        assert!(objects.iter().all(|object| object.model.is_finite()));
+        assert!(
+            objects
+                .iter()
+                .all(|object| object.model.w_axis.x > tower.width * 0.5)
+        );
+    }
+
+    #[test]
+    fn filesystem_paths_get_stable_lightning_seeds() {
+        assert_eq!(
+            path_seed(Path::new("/one/two")),
+            path_seed(Path::new("/one/two"))
+        );
+        assert_ne!(
+            path_seed(Path::new("/one/two")),
+            path_seed(Path::new("/one/three"))
+        );
     }
 
     #[test]

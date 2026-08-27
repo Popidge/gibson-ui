@@ -6,6 +6,7 @@ mod navigation;
 mod navigator;
 mod renderer;
 mod scene;
+mod system_load;
 mod terminal;
 mod theme;
 mod topology;

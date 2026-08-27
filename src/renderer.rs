@@ -2,7 +2,11 @@ use crate::config::{FrameRate, Settings, SettingsSnapshot, ThemeBackdrop};
 use crate::layout::{CockpitLayout, LayoutPreferences, PaneTarget, Rect, Splitter};
 use crate::navigation::VisualState;
 use crate::navigator::NavigatorSnapshot;
-use crate::scene::{CameraSubject, FacePanel, MAX_RENDER_OBJECTS, RenderObject, Scene, TowerLabel};
+use crate::scene::{
+    CameraSubject, FacePanel, LightningOptions, MAX_RENDER_OBJECTS, RenderObject, Scene,
+    SceneRenderContext, TowerLabel,
+};
+use crate::system_load::SystemLoad;
 use crate::terminal::{TerminalColor, TerminalSnapshot, TerminalSpan};
 use crate::theme::OmarchyTheme;
 use anyhow::Context;
@@ -267,8 +271,8 @@ impl PerformanceStats {
         self.text_prepare_cpu = Duration::ZERO;
     }
 
-    fn hud_text(&self, width: f32) -> String {
-        format_performance_hud(self.latest, width)
+    fn hud_text(&self, width: f32, system_load: f32) -> String {
+        format_performance_hud(self.latest, width, system_load)
     }
 }
 
@@ -341,6 +345,7 @@ pub struct Renderer {
     orbit_angle: f32,
     orbit_target: f32,
     performance: PerformanceStats,
+    system_load: SystemLoad,
     adapter_name: String,
     window: Arc<Window>,
 }
@@ -842,6 +847,7 @@ impl Renderer {
             orbit_angle: 0.0,
             orbit_target: 0.0,
             performance: PerformanceStats::new(started, settings.graphics.performance_log),
+            system_load: SystemLoad::new(started),
             adapter_name,
             window,
         })
@@ -1164,6 +1170,7 @@ impl Renderer {
             settings,
         } = status;
         let now = Instant::now();
+        let system_load = self.system_load.sample(now);
         let visualiser = self.layout.visualiser;
         let camera = self.update_camera(scene, visual_state, navigator.selection_position, now);
         let eye = camera.eye;
@@ -1171,16 +1178,28 @@ impl Renderer {
         let flight_intensity = camera.flight_intensity;
 
         let scene_started = Instant::now();
+        let quality = self.settings.graphics.quality;
+        let lightning = if self.settings.graphics.system_lightning {
+            LightningOptions {
+                load: system_load,
+                max_arcs: quality.lightning_arcs(),
+                segments: quality.lightning_segments(),
+            }
+        } else {
+            LightningOptions::OFF
+        };
         scene.write_render_objects(
-            now,
-            visual_state,
-            eye,
-            self.camera_focus,
-            self.settings.graphics.quality.max_objects(),
+            SceneRenderContext {
+                now,
+                state: visual_state,
+                camera_eye: eye,
+                camera_focus: self.camera_focus,
+                max_objects: quality.max_objects(),
+                lightning,
+            },
             &mut self.render_objects,
         );
-        self.render_objects
-            .truncate(self.settings.graphics.quality.max_objects());
+        self.render_objects.truncate(quality.max_objects());
         let instance_count = self.render_objects.len() + 1;
         self.instances.clear();
         self.instances.push(InstanceRaw {
@@ -1295,7 +1314,7 @@ impl Renderer {
             self.settings.graphics.quality.max_labels(),
         );
         let labels_cpu = labels_started.elapsed();
-        let hud_text = self.performance.hud_text(visualiser.width);
+        let hud_text = self.performance.hud_text(visualiser.width, system_load);
         let terminal_hud_text = self
             .layout
             .terminal
@@ -1881,10 +1900,13 @@ fn performance_hud_rect(viewport: Rect) -> Rect {
     }
 }
 
-fn format_performance_hud(sample: PerformanceSample, width: f32) -> String {
+fn format_performance_hud(sample: PerformanceSample, width: f32, system_load: f32) -> String {
+    let load_percent = system_load.clamp(0.0, 1.0) * 100.0;
     if sample.fps <= 0.0 {
         return if width >= 1_050.0 {
-            "GIBSON // FPS -- // CPU -- // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)".to_owned()
+            format!(
+                "GIBSON // FPS -- // CPU -- // LOAD {load_percent:.0}% // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)"
+            )
         } else {
             "GIBSON // FPS -- // CPU -- // F2 (FOCUS) // F10 (SETTINGS)".to_owned()
         };
@@ -1896,15 +1918,16 @@ fn format_performance_hud(sample: PerformanceSample, width: f32) -> String {
         )
     } else if width < 1_050.0 {
         format!(
-            "GIBSON // {:.1} FPS // {:.2} MS CPU // {} OBJECTS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F10 (SETTINGS)",
-            sample.fps, sample.frame_cpu_ms, sample.object_count,
+            "GIBSON // {:.1} FPS // {:.2} MS CPU // LOAD {:.0}% // {} OBJECTS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F10 (SETTINGS)",
+            sample.fps, sample.frame_cpu_ms, load_percent, sample.object_count,
         )
     } else {
         format!(
-            "GIBSON // {:.1} FPS // {:.2} MS CPU // {:.2} MS SCENE // {} OBJECTS // {} LABELS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)",
+            "GIBSON // {:.1} FPS // {:.2} MS CPU // {:.2} MS SCENE // LOAD {:.0}% // {} OBJECTS // {} LABELS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)",
             sample.fps,
             sample.frame_cpu_ms,
             sample.scene_cpu_ms,
+            load_percent,
             sample.object_count,
             sample.label_count,
         )
@@ -2707,8 +2730,8 @@ mod renderer_tests {
             object_count: 801,
             label_count: 8,
         };
-        let compact = format_performance_hud(sample, 480.0);
-        let wide = format_performance_hud(sample, 1_280.0);
+        let compact = format_performance_hud(sample, 480.0, 0.73);
+        let wide = format_performance_hud(sample, 1_280.0, 0.73);
 
         assert_eq!(
             compact,
@@ -2716,6 +2739,7 @@ mod renderer_tests {
         );
         assert!(wide.contains("60.2 FPS"));
         assert!(wide.contains("0.31 MS SCENE"));
+        assert!(wide.contains("LOAD 73%"));
         assert!(wide.contains("801 OBJECTS // 8 LABELS"));
         assert!(wide.contains("LEFT/RIGHT (ORBIT)"));
         assert!(wide.contains("F3 (TERMINAL) // F4 (FILES)"));
