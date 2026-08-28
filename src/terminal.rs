@@ -21,6 +21,7 @@ const NAVIGATION_SEQUENCE: &[u8] = b"\x1b[99~";
 #[derive(Clone, Debug)]
 pub enum TerminalEvent {
     Cwd(PathBuf),
+    NavigationFailed,
     Prompt,
     Exited,
     Error(String),
@@ -90,9 +91,15 @@ impl vt100::Callbacks for ParserCallbacks {
                     let _ = self.event_tx.send(TerminalEvent::Cwd(path));
                 }
             }
-            Some(b"777") if params.get(1).copied() == Some(b"prompt") => {
-                let _ = self.event_tx.send(TerminalEvent::Prompt);
-            }
+            Some(b"777") => match params.get(1).copied() {
+                Some(b"prompt") => {
+                    let _ = self.event_tx.send(TerminalEvent::Prompt);
+                }
+                Some(b"navigation-failed") => {
+                    let _ = self.event_tx.send(TerminalEvent::NavigationFailed);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -443,6 +450,7 @@ fn manager(
                     .and_then(|()| writer.write_all(NAVIGATION_SEQUENCE))
                     .and_then(|()| writer.flush())
                 {
+                    let _ = event_tx.send(TerminalEvent::NavigationFailed);
                     let _ = event_tx.send(TerminalEvent::Error(format!(
                         "shell navigation failed: {error}"
                     )));
@@ -513,37 +521,50 @@ if [[ -f "$HOME/.bashrc" ]]; then
   source "$HOME/.bashrc"
 fi
 
-__gibson_original_prompt_command="${PROMPT_COMMAND:-}"
-
 __gibson_emit_cwd() {
   printf '\033]7;file://gibson%s\007' "$PWD"
 }
 
 __gibson_prompt_dispatch() {
-  printf '\033]777;prompt\007'
   __gibson_emit_cwd
-  if [[ -n "$__gibson_original_prompt_command" ]]; then
-    eval "$__gibson_original_prompt_command"
-  fi
+  printf '\033]777;prompt\007'
 }
 
-__gibson_cd_from_ui() {
+__gibson_prepare_cd_from_ui() {
+  __gibson_saved_readline_line="$READLINE_LINE"
+  __gibson_saved_readline_point="$READLINE_POINT"
   local __gibson_target=""
   IFS= read -r -d '' __gibson_target < "$GIBSON_CONTROL_FILE" || true
-  if [[ -n "$__gibson_target" ]]; then
-    builtin cd -- "$__gibson_target" || return
-    __gibson_emit_cwd
+  if [[ -z "$__gibson_target" ]] || ! builtin cd -- "$__gibson_target"; then
+    printf '\033]777;navigation-failed\007'
   fi
+  READLINE_LINE=""
+  READLINE_POINT=0
 }
 
-PROMPT_COMMAND=__gibson_prompt_dispatch
-bind -x '"\e[99~":__gibson_cd_from_ui'
+__gibson_restore_readline_line() {
+  READLINE_LINE="${__gibson_saved_readline_line:-}"
+  READLINE_POINT="${__gibson_saved_readline_point:-0}"
+  unset __gibson_saved_readline_line __gibson_saved_readline_point
+}
+
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+  PROMPT_COMMAND+=(__gibson_prompt_dispatch)
+elif [[ -n "${PROMPT_COMMAND:-}" ]]; then
+  PROMPT_COMMAND=("$PROMPT_COMMAND" __gibson_prompt_dispatch)
+else
+  PROMPT_COMMAND=(__gibson_prompt_dispatch)
+fi
+bind -x '"\e[98~":__gibson_prepare_cd_from_ui'
+bind -x '"\e[97~":__gibson_restore_readline_line'
+bind '"\e[99~":"\e[98~\C-m\e[97~"'
 export TERM=xterm-256color
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -555,6 +576,17 @@ mod tests {
     #[test]
     fn rejects_non_file_osc_values() {
         assert!(osc7_path(b"https://example.test/path").is_none());
+    }
+
+    #[test]
+    fn parses_navigation_failure_marker() {
+        let (event_tx, event_rx) = unbounded();
+        let mut parser = Parser::new_with_callbacks(2, 20, 0, ParserCallbacks { event_tx });
+        parser.process(b"\x1b]777;navigation-failed\x07");
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TerminalEvent::NavigationFailed)
+        ));
     }
 
     #[test]
@@ -603,19 +635,119 @@ mod tests {
         }
         assert!(navigated, "Bash did not report the requested directory");
 
+        thread::sleep(Duration::from_millis(50));
         let before_output = terminal.snapshot();
         let cached = terminal.snapshot();
         assert!(Arc::ptr_eq(&before_output, &cached));
-        terminal.send_input(b"printf 'GIBSON_PTY_OK\\n'\r".to_vec());
+        terminal.send_input(b"printf 'GIBSON_PTY_CWD=%s\\n' \"$PWD\"\r".to_vec());
         wait_for_prompt(&terminal, Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(50));
         let snapshot = terminal.snapshot();
         assert!(!Arc::ptr_eq(&before_output, &snapshot));
+        let expected = format!("GIBSON_PTY_CWD={}", child.display());
         assert!(
             snapshot
                 .spans
                 .iter()
-                .any(|span| span.text.contains("GIBSON_PTY_OK"))
+                .any(|span| span.text.contains(&expected)),
+            "the live shell did not change to {}",
+            child.display()
         );
+    }
+
+    #[test]
+    fn pty_reports_rejected_scene_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        let terminal =
+            Terminal::spawn_with_shell(temp.path(), Some(OsString::from("/bin/bash"))).unwrap();
+        wait_for_prompt(&terminal, Duration::from_secs(5));
+
+        terminal.navigate(temp.path().join("does-not-exist"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(
+                terminal.event_rx.recv_timeout(Duration::from_millis(100)),
+                Ok(TerminalEvent::NavigationFailed)
+            ) {
+                return;
+            }
+        }
+        panic!("Bash did not reject the missing directory");
+    }
+
+    #[test]
+    fn scene_navigation_refreshes_the_visible_prompt_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            home.join(".bashrc"),
+            b"PS1='PROMPT:\\w> '\nPROMPT_COMMAND=('printf \"PRECMD\\n\"')\n",
+        )
+        .unwrap();
+        let shell = temp.path().join("test-bash");
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/bash\nexport HOME={}\nexec /bin/bash \"$@\"\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let terminal = Terminal::spawn_with_shell(&root, Some(shell.into_os_string())).unwrap();
+        wait_for_prompt(&terminal, Duration::from_secs(5));
+        terminal.send_input(b"printf 'BUFFER_PRESERVED\\n'".to_vec());
+        terminal.navigate(child.clone());
+        wait_for_cwd(&terminal, &child, Duration::from_secs(5));
+        wait_for_prompt(&terminal, Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(50));
+
+        let text = terminal
+            .snapshot()
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains(&format!("PROMPT:{}> ", child.display())),
+            "the visible prompt did not refresh after navigation: {text:?}"
+        );
+        assert!(
+            text.contains("PRECMD"),
+            "the existing PROMPT_COMMAND array did not run: {text:?}"
+        );
+        assert!(
+            text.contains("printf 'BUFFER_PRESERVED\\n'"),
+            "the pending command line was not restored: {text:?}"
+        );
+
+        terminal.send_input(b"\r".to_vec());
+        wait_for_prompt(&terminal, Duration::from_secs(5));
+        let text = terminal
+            .snapshot()
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("BUFFER_PRESERVED"));
+    }
+
+    fn wait_for_cwd(terminal: &Terminal, expected: &Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(TerminalEvent::Cwd(path)) =
+                terminal.event_rx.recv_timeout(Duration::from_millis(100))
+                && path == expected
+            {
+                return;
+            }
+        }
+        panic!("Bash did not report {}", expected.display());
     }
 
     fn wait_for_prompt(terminal: &Terminal, timeout: Duration) {

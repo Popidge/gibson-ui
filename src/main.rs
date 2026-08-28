@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
         settings_menu: SettingsMenu::new(settings, omarchy_available),
         theme_watcher,
         input_target: InputTarget::Terminal,
-        requested_navigator_path: None,
+        navigator_cd: NavigatorCd::default(),
         pending_navigation: None,
         shell_at_prompt: false,
         modifiers: ModifiersState::default(),
@@ -190,7 +190,7 @@ struct App {
     settings_menu: SettingsMenu,
     theme_watcher: ThemeWatcher,
     input_target: InputTarget,
-    requested_navigator_path: Option<PathBuf>,
+    navigator_cd: NavigatorCd,
     pending_navigation: Option<(PathBuf, NavigationSource)>,
     shell_at_prompt: bool,
     modifiers: ModifiersState,
@@ -208,6 +208,41 @@ enum InputTarget {
 enum NavigationSource {
     Navigator,
     Terminal,
+}
+
+#[derive(Default)]
+struct NavigatorCd {
+    in_flight: Option<PathBuf>,
+    queued: Option<PathBuf>,
+}
+
+impl NavigatorCd {
+    fn request(&mut self, path: PathBuf, shell_at_prompt: bool) -> Option<PathBuf> {
+        if shell_at_prompt && self.in_flight.is_none() {
+            self.in_flight = Some(path.clone());
+            Some(path)
+        } else {
+            self.queued = Some(path);
+            None
+        }
+    }
+
+    fn finish_request(&mut self) -> Option<PathBuf> {
+        self.in_flight.take()
+    }
+
+    fn take_queued(&mut self, shell_at_prompt: bool) -> Option<PathBuf> {
+        if !shell_at_prompt || self.in_flight.is_some() {
+            return None;
+        }
+        let path = self.queued.take()?;
+        self.in_flight = Some(path.clone());
+        Some(path)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.in_flight.is_some() || self.queued.is_some()
+    }
 }
 
 impl App {
@@ -245,25 +280,40 @@ impl App {
         while let Ok(event) = self.terminal.event_rx.try_recv() {
             match event {
                 TerminalEvent::Cwd(path) => {
+                    let requested = self.navigator_cd.finish_request();
+                    let source = if requested.is_some() {
+                        NavigationSource::Navigator
+                    } else {
+                        NavigationSource::Terminal
+                    };
                     if path.is_dir() && path != self.scene.root() {
-                        let source = if self.requested_navigator_path.as_ref() == Some(&path) {
-                            self.requested_navigator_path = None;
-                            NavigationSource::Navigator
-                        } else {
-                            self.requested_navigator_path = None;
-                            NavigationSource::Terminal
-                        };
                         self.pending_navigation = Some((path.clone(), source));
-                        info!(path = %path.display(), "shell changed directory");
+                        if let Some(requested) = requested
+                            && requested != path
+                        {
+                            info!(
+                                requested = %requested.display(),
+                                actual = %path.display(),
+                                "shell resolved navigator directory"
+                            );
+                        } else {
+                            info!(path = %path.display(), "shell changed directory");
+                        }
                         self.watcher.set_root(path.clone());
                         self.topology_indexer.prioritise(path.clone());
-                    } else if self.requested_navigator_path.as_ref() == Some(&path) {
-                        self.requested_navigator_path = None;
                     }
+                    self.dispatch_queued_navigator_cd();
+                }
+                TerminalEvent::NavigationFailed => {
+                    if let Some(path) = self.navigator_cd.finish_request() {
+                        warn!(path = %path.display(), "shell rejected navigator directory");
+                    }
+                    self.dispatch_queued_navigator_cd();
                 }
                 TerminalEvent::Prompt => {
                     self.shell_at_prompt = true;
                     self.scene.finish_command();
+                    self.dispatch_queued_navigator_cd();
                 }
                 TerminalEvent::Exited => {
                     self.shell_exited = true;
@@ -388,12 +438,19 @@ impl App {
     }
 
     fn navigate_from_navigator(&mut self, path: PathBuf) {
-        if !self.shell_at_prompt {
-            return;
+        if let Some(path) = self.navigator_cd.request(path, self.shell_at_prompt) {
+            info!(path = %path.display(), "requesting navigator directory from shell");
+            self.shell_at_prompt = false;
+            self.terminal.navigate(path);
         }
-        self.requested_navigator_path = Some(path.clone());
-        self.scene.set_visual_state(VisualState::Transit);
-        self.terminal.navigate(path);
+    }
+
+    fn dispatch_queued_navigator_cd(&mut self) {
+        if let Some(path) = self.navigator_cd.take_queued(self.shell_at_prompt) {
+            info!(path = %path.display(), "applying queued navigator directory");
+            self.shell_at_prompt = false;
+            self.terminal.navigate(path);
+        }
     }
 
     fn activate_navigator(&mut self) {
@@ -675,6 +732,7 @@ impl App {
         let status = RenderStatus {
             terminal_focused: self.input_target == InputTarget::Terminal
                 && !self.settings_menu.is_open(),
+            navigation_pending: self.navigator_cd.is_pending(),
             visual_state: self.visual_state(),
             settings: settings_snapshot.as_ref(),
         };
@@ -905,5 +963,39 @@ mod tests {
         let path = temp.path().join("file with spaces.txt");
         fs::write(&path, b"data").unwrap();
         open_with("/bin/true", &path).unwrap();
+    }
+
+    #[test]
+    fn navigator_cd_dispatches_immediately_at_a_prompt() {
+        let target = PathBuf::from("/tmp/target");
+        let mut navigation = NavigatorCd::default();
+
+        assert_eq!(navigation.request(target.clone(), true), Some(target));
+        assert!(navigation.is_pending());
+    }
+
+    #[test]
+    fn navigator_cd_queues_the_latest_request_until_the_prompt() {
+        let first = PathBuf::from("/tmp/first");
+        let latest = PathBuf::from("/tmp/latest");
+        let mut navigation = NavigatorCd::default();
+
+        assert_eq!(navigation.request(first, false), None);
+        assert_eq!(navigation.request(latest.clone(), false), None);
+        assert_eq!(navigation.take_queued(false), None);
+        assert_eq!(navigation.take_queued(true), Some(latest));
+    }
+
+    #[test]
+    fn navigator_cd_waits_for_acknowledgement_before_dispatching_another_request() {
+        let first = PathBuf::from("/tmp/first");
+        let second = PathBuf::from("/tmp/second");
+        let mut navigation = NavigatorCd::default();
+
+        assert_eq!(navigation.request(first.clone(), true), Some(first.clone()));
+        assert_eq!(navigation.request(second.clone(), true), None);
+        assert_eq!(navigation.take_queued(true), None);
+        assert_eq!(navigation.finish_request(), Some(first));
+        assert_eq!(navigation.take_queued(true), Some(second));
     }
 }

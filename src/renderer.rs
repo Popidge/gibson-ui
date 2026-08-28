@@ -171,6 +171,7 @@ struct HudContent<'a> {
 
 pub struct RenderStatus<'a> {
     pub terminal_focused: bool,
+    pub navigation_pending: bool,
     pub visual_state: VisualState,
     pub settings: Option<&'a SettingsSnapshot>,
 }
@@ -271,8 +272,13 @@ impl PerformanceStats {
         self.text_prepare_cpu = Duration::ZERO;
     }
 
-    fn hud_text(&self, width: f32, system_load: f32) -> String {
-        format_performance_hud(self.latest, width, system_load)
+    fn hud_text(&self, width: f32, system_load: f32, navigation_pending: bool) -> String {
+        let text = format_performance_hud(self.latest, width, system_load);
+        if navigation_pending {
+            text.replacen("GIBSON // ", "GIBSON // CD PENDING // ", 1)
+        } else {
+            text
+        }
     }
 }
 
@@ -1166,6 +1172,7 @@ impl Renderer {
         let frame_started = Instant::now();
         let RenderStatus {
             terminal_focused: terminal_focus,
+            navigation_pending,
             visual_state,
             settings,
         } = status;
@@ -1314,7 +1321,9 @@ impl Renderer {
             self.settings.graphics.quality.max_labels(),
         );
         let labels_cpu = labels_started.elapsed();
-        let hud_text = self.performance.hud_text(visualiser.width, system_load);
+        let hud_text = self
+            .performance
+            .hud_text(visualiser.width, system_load, navigation_pending);
         let terminal_hud_text = self
             .layout
             .terminal
