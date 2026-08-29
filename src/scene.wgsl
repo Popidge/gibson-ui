@@ -136,7 +136,7 @@ fn movie_circuit_floor(position: vec2<f32>) -> vec4<f32> {
     ), 0.0)) * trace * uniforms.pulse.z;
     let distance_to_camera = distance(position, uniforms.camera_time.xz);
     let fade = 1.0 - smoothstep(62.0, 108.0, distance_to_camera);
-    let board = uniforms.background.rgb * 0.035 + vec3<f32>(0.001, 0.008, 0.018);
+    let board = uniforms.background.rgb * 0.32;
     let cyan = uniforms.primary.rgb * (trace * 0.78 + node * 1.25 + pulse * 1.7);
     let magenta = uniforms.secondary.rgb * macro_trace * 0.58;
     return vec4<f32>(board + (cyan + magenta) * fade, 1.0);
@@ -230,7 +230,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             0.010 + max(fwidth(edge_distance) * 1.6, 0.016),
             edge_distance,
         );
-        let classic_face = uniforms.background.rgb * 0.035 + vec3<f32>(0.001, 0.009, 0.015);
+        let classic_face = uniforms.background.rgb * 0.24;
         var base = classic_face;
         if movie_style {
             base = blurred_scene(input.clip_position.xy) * 0.34

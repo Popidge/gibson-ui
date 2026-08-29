@@ -52,17 +52,21 @@ Cockpit mode opens fullscreen without workspace control when Hyprland is not ava
 
 GIBSON does not change your Hyprland settings.
 
-Add this line to `~/.config/hypr/bindings.conf` if you want a cockpit keybind:
+Add this line to `~/.config/hypr/bindings.lua` if you want a cockpit keybind:
 
-```ini
-bindd = SUPER CTRL, G, GIBSON cockpit, exec, uwsm-app -- gibson-ui --cockpit
+```lua
+o.bind("SUPER + CTRL + G", "GIBSON cockpit", o.launch("gibson-ui --cockpit"))
 ```
 
 Change the key combination if it conflicts with your settings.
 
 ## Omarchy integration
 
-GIBSON reads the active Omarchy palette and background. A theme change updates the running application.
+GIBSON maps its scene palette to the active Omarchy theme. The Omarchy accent is the primary scene colour.
+
+Wallpaper mode matches Omarchy's monitor crop and position. The image continues through the visualiser and terminal panes.
+
+Theme and wallpaper changes update the running application.
 
 It also reads the Foot font and colour settings. Included Foot configuration files work as expected.
 
@@ -115,6 +119,7 @@ The settings screen uses Up and Down for selection. Use Left and Right to change
 - Provides four quality levels and four frame-rate modes.
 - Shows live frame rate and control hints in the visualiser HUD.
 - Provides classic and 1995 film visual styles.
+- Aligns the Omarchy wallpaper across the complete window.
 
 The file navigator does not change file-system data. Use the terminal for write operations.
 
@@ -213,6 +218,8 @@ The Mixkit source files are not part of this repository. See [the sound asset no
 
 The default `high` setting targets 60 frames per second on a six-year-old Radeon Vega laptop.
 
+GIBSON caches tower-label textures and uses stable tower identifiers in the render loop.
+
 Use `balanced` or `performance` for more GPU headroom. Use `cinematic` for more objects and labels.
 
 The HUD shows the frame rate and the main controls.
@@ -234,7 +241,7 @@ File names do not enter generated shell source. The Bash bridge reads exact path
 - The directory index stops after 250,000 directories.
 - The visualiser shows no more than 128 towers at one time.
 - Tower sizes use direct-child data instead of recursive disk usage.
-- Tower labels use screen-facing GPU text with depth occlusion.
+- Tower labels use tower-face GPU text with depth occlusion.
 - The renderer does not contain a bloom post-process.
 
 ## Development

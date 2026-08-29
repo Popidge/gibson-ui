@@ -10,6 +10,7 @@ mod system_load;
 mod terminal;
 mod theme;
 mod topology;
+mod wallpaper;
 
 use anyhow::{Context, bail};
 use audio::Soundscape;
@@ -34,6 +35,7 @@ use topology::{
     affects_visible_city, hierarchy_route,
 };
 use tracing::{error, info, warn};
+use wallpaper::WallpaperPlacementWatcher;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -143,6 +145,8 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let track_wallpaper = settings.appearance.follow_omarchy
+        && settings.appearance.backdrop == config::ThemeBackdrop::Wallpaper;
     let mut app = App {
         initial_root: root.clone(),
         start_fullscreen: args.fullscreen || args.cockpit,
@@ -160,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         soundscape,
         settings_menu: SettingsMenu::new(settings, omarchy_available),
         theme_watcher,
+        wallpaper_placement: WallpaperPlacementWatcher::spawn(track_wallpaper),
         input_target: InputTarget::Terminal,
         navigator_cd: NavigatorCd::default(),
         pending_navigation: None,
@@ -189,6 +194,7 @@ struct App {
     soundscape: Option<Soundscape>,
     settings_menu: SettingsMenu,
     theme_watcher: ThemeWatcher,
+    wallpaper_placement: WallpaperPlacementWatcher,
     input_target: InputTarget,
     navigator_cd: NavigatorCd,
     pending_navigation: Option<(PathBuf, NavigationSource)>,
@@ -332,6 +338,11 @@ impl App {
         {
             renderer.apply_omarchy_theme(&theme);
             info!(theme = %theme.name, "Omarchy theme applied");
+        }
+        if let Some(placement) = self.wallpaper_placement.poll()
+            && let Some(renderer) = &mut self.renderer
+        {
+            renderer.set_wallpaper_placement(placement);
         }
         let flying = self.visual_state() == VisualState::Transit;
         if let Some(soundscape) = &mut self.soundscape {
@@ -483,6 +494,10 @@ impl App {
         if let Some(soundscape) = &mut self.soundscape {
             soundscape.apply_settings(settings.audio.enabled, settings.audio.master_volume);
         }
+        self.wallpaper_placement.set_enabled(
+            settings.appearance.follow_omarchy
+                && settings.appearance.backdrop == config::ThemeBackdrop::Wallpaper,
+        );
         self.next_frame = Instant::now();
     }
 
@@ -883,13 +898,24 @@ fn enter_cockpit_workspace() {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return;
     }
-    let result = Command::new("hyprctl")
-        .args(["dispatch", "workspace", "empty"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if result.is_err() || result.is_ok_and(|status| !status.success()) {
+
+    // Hyprland 0.55 replaced the legacy dispatcher syntax with Lua expressions.
+    // Keep the legacy form as a fallback so cockpit mode still works on 0.54.
+    let entered = [
+        vec!["dispatch", r#"hl.dsp.focus({ workspace = "empty" })"#],
+        vec!["dispatch", "workspace", "empty"],
+    ]
+    .into_iter()
+    .any(|args| {
+        Command::new("hyprctl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    });
+    if !entered {
         error!("cannot select an empty Hyprland workspace for cockpit mode");
     }
 }

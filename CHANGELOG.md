@@ -4,6 +4,18 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-29
+
+- Fixed cockpit mode on Hyprland 0.55 and later.
+- Added cached, depth-aware tower labels to the 3D scene pipeline.
+- Fixed tower-label anchoring during orbit changes.
+- Reduced per-frame text preparation and file-path comparison costs.
+- Improved camera framing for sparse and tall directories.
+- Mapped the complete visualiser palette to the active Omarchy theme.
+- Added live theme and wallpaper updates to a running session.
+- Extended the Omarchy wallpaper across the complete GIBSON window.
+- Aligned the wallpaper with its monitor position during window moves and layout changes.
+
 ## 0.2.0 - 2026-08-29
 
 - Added the 1995 film visual style with glass towers and a circuit-board floor.
