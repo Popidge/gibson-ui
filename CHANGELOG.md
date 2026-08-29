@@ -4,7 +4,16 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
-- Added tower lightning that responds to live CPU and scheduler load.
+## 0.2.0 - 2026-08-29
+
+- Added the 1995 film visual style with glass towers and a circuit-board floor.
+- Added a GPU blur behind translucent tower surfaces.
+- Moved the tower-face navigator into the 3D scene pipeline.
+- Added depth-aware GPU text for tower labels.
+- Added tower lightning that responds to CPU and scheduler load.
+- Improved navigator-to-terminal directory changes with prompt acknowledgement and queued requests.
+- Fixed Omarchy backgrounds that use extensionless symbolic links.
+- Changed the visualiser HUD to focus on frame rate and controls.
 
 ## 0.1.0 - 2026-08-27
 
@@ -17,4 +26,4 @@ This project uses [Semantic Versioning](https://semver.org/).
 - Added responsive cockpit layouts and persistent settings.
 - Added live Omarchy palette, background, and Foot integration.
 - Added graphics-quality, frame-rate, and performance controls.
-- Added the desktop launcher and AUR binary package.
+- Added the desktop launcher and Arch binary package recipe.

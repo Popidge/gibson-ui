@@ -52,6 +52,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         uv.y = (uv.y - 0.5) * visible + 0.5;
     }
     let image = textureSample(background_texture, background_sampler, uv).rgb;
-    let tinted = mix(image, image * uniforms.background.rgb * 1.8, 0.22);
-    return vec4<f32>(tinted * 0.22, 1.0);
+    let theme_tint = vec3<f32>(0.72) + uniforms.background.rgb * 0.55;
+    let tinted = mix(image, image * theme_tint, 0.16);
+    return vec4<f32>(tinted * 0.58, 1.0);
 }

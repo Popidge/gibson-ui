@@ -1,3 +1,4 @@
+use crate::config::VisualStyle;
 use crate::filesystem::{FileEntry, FileMutation};
 use crate::navigation::VisualState;
 use crate::topology::{CityTowerPlacement, city_grid_position};
@@ -55,6 +56,7 @@ pub struct SceneRenderContext {
     pub camera_focus: Vec3,
     pub max_objects: usize,
     pub lightning: LightningOptions,
+    pub visual_style: VisualStyle,
 }
 
 impl LightningOptions {
@@ -519,6 +521,7 @@ impl Scene {
             camera_eye,
             camera_focus,
             max_objects,
+            visual_style,
             ..
         } = context;
         let current_path = &self.root;
@@ -546,30 +549,43 @@ impl Scene {
             let position = tower.position + Vec3::new(0.0, scale.y * 0.5 - 0.05, 0.0);
             let model = Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, position);
             let age = now.duration_since(tower.updated).as_secs_f32();
-            let color = if !tower.readable {
-                [0.72, 0.03, 0.24, 1.15]
-            } else if tower.path == *current_path {
+            let mut color = if tower.path == *current_path {
                 let pulse = (age * 4.0).sin().abs() * 0.12;
                 [0.015, 0.44 + pulse, 0.68 + pulse, 1.55]
+            } else if !tower.readable {
+                [0.72, 0.03, 0.24, 1.15]
             } else if tower.known {
                 [0.02, 0.72, 0.78, 1.25]
             } else {
                 [0.02, 0.31, 0.58, 0.85]
             };
+            if visual_style == VisualStyle::Movie1995 {
+                color[3] = if tower.path == *current_path {
+                    0.22
+                } else if !tower.readable {
+                    0.24
+                } else if tower.known {
+                    0.18
+                } else {
+                    0.14
+                };
+            }
             objects.push(RenderObject { model, color });
         }
 
         if let Some(current) = self.towers.get(current_path) {
-            add_tower_bands(
-                objects,
-                current,
-                tower_height(current),
-                tower_width(current),
-                now,
-            );
-            if state.shows_storeys() {
-                add_storey_slabs(objects, current, now);
-                add_file_effects(objects, current, &self.file_effects, now);
+            if visual_style == VisualStyle::Classic && !state.shows_file_menu() {
+                add_tower_bands(
+                    objects,
+                    current,
+                    tower_height(current),
+                    tower_width(current),
+                    now,
+                );
+                if state.shows_storeys() {
+                    add_storey_slabs(objects, current, now);
+                    add_file_effects(objects, current, &self.file_effects, now);
+                }
             }
             if state != VisualState::Settled {
                 for entry in current
@@ -593,18 +609,20 @@ impl Scene {
             }
         }
         self.add_system_lightning(objects, context);
-        for path in &self.tower_order {
-            if objects.len() >= max_objects || path == current_path {
-                continue;
+        if visual_style == VisualStyle::Classic {
+            for path in &self.tower_order {
+                if objects.len() >= max_objects || path == current_path {
+                    continue;
+                }
+                let Some(tower) = self
+                    .towers
+                    .get(path)
+                    .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
+                else {
+                    continue;
+                };
+                add_tower_bands(objects, tower, tower_height(tower), tower_width(tower), now);
             }
-            let Some(tower) = self
-                .towers
-                .get(path)
-                .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
-            else {
-                continue;
-            };
-            add_tower_bands(objects, tower, tower_height(tower), tower_width(tower), now);
         }
         objects.truncate(max_objects);
     }
@@ -621,6 +639,7 @@ impl Scene {
         camera_eye: Vec3,
         camera_focus: Vec3,
         max_labels: usize,
+        visual_style: VisualStyle,
     ) -> Vec<TowerLabel> {
         let max_labels = max_labels.clamp(1, MAX_TOWER_LABELS);
         let face_direction = Vec3::new(face_outward.x, 0.0, face_outward.z)
@@ -652,9 +671,14 @@ impl Scene {
                 continue;
             }
             let current = tower.path == self.root;
+            let label_height = if visual_style == VisualStyle::Movie1995 && !current {
+                tower_height(tower) * 0.68
+            } else {
+                tower_height(tower) + 0.24
+            };
             let world_position = tower.position
-                + face_direction * (tower_width(tower) * 0.52)
-                + Vec3::Y * (tower_height(tower) + 0.24);
+                + face_direction * (tower_width(tower) * 0.52 + 0.015)
+                + Vec3::Y * label_height;
             let occluded = visible_towers.iter().any(|occluder| {
                 occluder.path != tower.path
                     && tower_occludes_point(occluder, camera_eye, world_position)
@@ -805,6 +829,7 @@ impl Scene {
             camera_focus,
             max_objects,
             lightning: options,
+            ..
         } = context;
         if options.max_arcs == 0 || options.segments < 2 || self.tower_order.is_empty() {
             return;
@@ -1070,10 +1095,10 @@ fn face_panel_for(tower: &Tower, outward: Vec3) -> FacePanel {
     let width = tower_width(tower);
     let height = tower_height(tower);
     FacePanel {
-        center: tower.position + outward * (width * 0.625 + 0.025) + Vec3::Y * (height * 0.50),
+        center: tower.position + outward * (width * 0.501) + Vec3::Y * (height * 0.50),
         horizontal: face_horizontal(outward),
-        width: width * 0.96,
-        height: (height * 0.88).clamp(3.5, 16.0),
+        width,
+        height,
     }
 }
 
@@ -1520,6 +1545,38 @@ mod tests {
 
         assert!(top > next);
         assert!(next > bottom);
+    }
+
+    #[test]
+    fn movie_style_uses_clean_glass_towers_without_storey_geometry() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("directory")).unwrap();
+        fs::write(temp.path().join("file.txt"), b"data").unwrap();
+        let root = temp.path().to_path_buf();
+        let mut scene = Scene::new(root.clone());
+        scene.update(root, scan_directory(temp.path()).unwrap(), &[]);
+        let now = Instant::now();
+        let context = |visual_style| SceneRenderContext {
+            now,
+            state: VisualState::Settled,
+            camera_eye: Vec3::new(0.0, 4.0, -8.0),
+            camera_focus: Vec3::ZERO,
+            max_objects: MAX_RENDER_OBJECTS,
+            lightning: LightningOptions::OFF,
+            visual_style,
+        };
+        let mut classic = Vec::new();
+        let mut movie = Vec::new();
+
+        scene.write_render_objects(context(VisualStyle::Classic), &mut classic);
+        scene.write_render_objects(context(VisualStyle::Movie1995), &mut movie);
+
+        assert!(movie.len() < classic.len());
+        assert!(
+            movie
+                .iter()
+                .all(|object| (0.1..0.3).contains(&object.color[3]))
+        );
     }
 
     #[test]

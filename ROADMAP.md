@@ -1,6 +1,6 @@
 # GIBSON roadmap
 
-GIBSON 0.1 establishes the complete product loop.
+GIBSON 0.1 established the complete product loop.
 
 The terminal and file navigator control the working directory. The visualiser turns each change into a city journey.
 
@@ -22,7 +22,18 @@ The first release includes these systems:
 - Persistent graphics, motion, audio, and theme settings.
 - Live Omarchy palette and background tracking.
 - Performance modes, frame limits, and live metrics.
-- A desktop launcher and an AUR binary package.
+- A desktop launcher and an Arch binary package recipe.
+
+## Version 0.2
+
+The second release adds these systems:
+
+- A 1995 film visual style with glass towers and a circuit-board floor.
+- GPU blur behind translucent tower surfaces.
+- A tower-face navigator in the 3D scene pipeline.
+- Depth-aware GPU text for tower labels.
+- Tower lightning that responds to system load.
+- More reliable two-way directory synchronisation.
 
 ## Later releases
 

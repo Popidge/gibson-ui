@@ -22,9 +22,7 @@ GIBSON targets [Omarchy](https://omarchy.org/) first. It also runs on other Arch
 
 ## Install
 
-The AUR package is ready, but new AUR account registrations are temporarily closed.
-
-Install the current release with the included Arch package recipe:
+Install the official GitHub release with the included Arch package recipe:
 
 ```bash
 sudo pacman -S --needed base-devel git
@@ -33,7 +31,9 @@ cd gibson-ui/packaging/aur
 makepkg -si
 ```
 
-AUR publication is planned when new account registrations are available again.
+This recipe installs the release binary with the complete Mixkit soundscape. It does not compile the application.
+
+AUR publication is planned when new account registrations are available again. Registration is temporarily closed.
 
 Open **GIBSON** from your desktop launcher. The launcher also provides a **Cockpit mode** action.
 
@@ -113,7 +113,8 @@ The settings screen uses Up and Down for selection. Use Left and Right to change
 - Provides wide cockpit and compact drawer layouts.
 - Stores splitter positions and pane visibility.
 - Provides four quality levels and four frame-rate modes.
-- Shows live performance data in the visualiser HUD.
+- Shows live frame rate and control hints in the visualiser HUD.
+- Provides classic and 1995 film visual styles.
 
 The file navigator does not change file-system data. Use the terminal for write operations.
 
@@ -134,6 +135,7 @@ The default settings do not require a file:
 quality = "high"
 frame_rate = "fps60"
 floor_pulses = true
+system_lightning = true
 scanlines = true
 motion_scale = 1.0
 performance_log = false
@@ -141,6 +143,7 @@ performance_log = false
 [appearance]
 follow_omarchy = true
 backdrop = "tint"
+visual_style = "classic"
 
 [behaviour]
 orbit_enabled = true
@@ -152,6 +155,8 @@ master_volume = 0.65
 ```
 
 The backdrop accepts `off`, `tint`, or `wallpaper`. Wallpaper mode requires Omarchy.
+
+The visual style accepts `classic` or `movie1995`.
 
 The frame rate accepts `fps30`, `fps60`, `fps120`, or `unlimited`.
 
@@ -210,7 +215,7 @@ The default `high` setting targets 60 frames per second on a six-year-old Radeon
 
 Use `balanced` or `performance` for more GPU headroom. Use `cinematic` for more objects and labels.
 
-The HUD shows frame rate, CPU frame time, and visible scene counts.
+The HUD shows the frame rate and the main controls.
 
 Use `--perf` to print detailed frame statistics every two seconds.
 
@@ -229,7 +234,7 @@ File names do not enter generated shell source. The Bash bridge reads exact path
 - The directory index stops after 250,000 directories.
 - The visualiser shows no more than 128 towers at one time.
 - Tower sizes use direct-child data instead of recursive disk usage.
-- Tower labels use screen-facing text instead of textured geometry.
+- Tower labels use screen-facing GPU text with depth occlusion.
 - The renderer does not contain a bloom post-process.
 
 ## Development

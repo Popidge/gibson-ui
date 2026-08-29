@@ -145,6 +145,28 @@ impl ThemeBackdrop {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisualStyle {
+    #[default]
+    Classic,
+    Movie1995,
+}
+
+impl VisualStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "CLASSIC CITY",
+            Self::Movie1995 => "1995 FILM",
+        }
+    }
+
+    fn adjust(self, direction: isize) -> Self {
+        const VALUES: [VisualStyle; 2] = [VisualStyle::Classic, VisualStyle::Movie1995];
+        cycle(self, direction, &VALUES)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct GraphicsSettings {
@@ -176,6 +198,7 @@ impl Default for GraphicsSettings {
 pub struct AppearanceSettings {
     pub follow_omarchy: bool,
     pub backdrop: ThemeBackdrop,
+    pub visual_style: VisualStyle,
 }
 
 impl Default for AppearanceSettings {
@@ -183,6 +206,7 @@ impl Default for AppearanceSettings {
         Self {
             follow_omarchy: true,
             backdrop: ThemeBackdrop::Tint,
+            visual_style: VisualStyle::Classic,
         }
     }
 }
@@ -286,6 +310,7 @@ pub struct SettingsMenu {
 enum SettingItem {
     FollowOmarchy,
     Backdrop,
+    VisualStyle,
     GraphicsQuality,
     FrameRate,
     FloorPulses,
@@ -300,9 +325,10 @@ enum SettingItem {
 }
 
 impl SettingsMenu {
-    const OMARCHY_ITEMS: [SettingItem; 13] = [
+    const OMARCHY_ITEMS: [SettingItem; 14] = [
         SettingItem::FollowOmarchy,
         SettingItem::Backdrop,
+        SettingItem::VisualStyle,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
@@ -315,8 +341,9 @@ impl SettingsMenu {
         SettingItem::Audio,
         SettingItem::AudioVolume,
     ];
-    const PORTABLE_ITEMS: [SettingItem; 12] = [
+    const PORTABLE_ITEMS: [SettingItem; 13] = [
         SettingItem::Backdrop,
+        SettingItem::VisualStyle,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
@@ -376,6 +403,10 @@ impl SettingsMenu {
                     .appearance
                     .backdrop
                     .adjust(direction, self.omarchy_available)
+            }
+            SettingItem::VisualStyle => {
+                self.settings.appearance.visual_style =
+                    self.settings.appearance.visual_style.adjust(direction)
             }
             SettingItem::GraphicsQuality => {
                 self.settings.graphics.quality = self.settings.graphics.quality.adjust(direction)
@@ -443,6 +474,10 @@ impl SettingsMenu {
             SettingItem::Backdrop => (
                 "BACKDROP",
                 self.settings.appearance.backdrop.label().to_owned(),
+            ),
+            SettingItem::VisualStyle => (
+                "VISUAL STYLE",
+                self.settings.appearance.visual_style.label().to_owned(),
             ),
             SettingItem::GraphicsQuality => (
                 "GRAPHICS QUALITY",
@@ -538,7 +573,7 @@ mod tests {
     #[test]
     fn menu_changes_persisted_values_and_marks_the_selected_row() {
         let mut menu = SettingsMenu::new(Settings::default(), true);
-        menu.move_selection(3);
+        menu.move_selection(4);
         assert!(menu.adjust(1));
         assert_eq!(menu.settings.graphics.frame_rate, FrameRate::Fps120);
         assert!(menu.snapshot().text.contains("▶ FRAME RATE"));
@@ -547,7 +582,7 @@ mod tests {
     #[test]
     fn system_lightning_can_be_disabled() {
         let mut menu = SettingsMenu::new(Settings::default(), true);
-        menu.move_selection(5);
+        menu.move_selection(6);
 
         assert!(menu.adjust(1));
         assert!(!menu.settings.graphics.system_lightning);
@@ -570,5 +605,24 @@ mod tests {
         assert!(menu.adjust(1));
         assert_eq!(menu.settings.appearance.backdrop, ThemeBackdrop::Tint);
         assert!(!menu.adjust(1));
+    }
+
+    #[test]
+    fn visual_style_is_selectable_and_defaults_for_old_settings() {
+        let loaded = toml::from_str::<Settings>("[appearance]\nfollow_omarchy = false\n").unwrap();
+        assert_eq!(loaded.appearance.visual_style, VisualStyle::Classic);
+
+        let mut menu = SettingsMenu::new(Settings::default(), true);
+        menu.move_selection(2);
+        assert!(menu.adjust(1));
+        assert_eq!(
+            menu.settings.appearance.visual_style,
+            VisualStyle::Movie1995
+        );
+        assert!(
+            menu.snapshot()
+                .text
+                .contains("▶ VISUAL STYLE           1995 FILM")
+        );
     }
 }

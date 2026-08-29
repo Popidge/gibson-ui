@@ -1,4 +1,4 @@
-use crate::config::{FrameRate, Settings, SettingsSnapshot, ThemeBackdrop};
+use crate::config::{FrameRate, Settings, SettingsSnapshot, ThemeBackdrop, VisualStyle};
 use crate::layout::{CockpitLayout, LayoutPreferences, PaneTarget, Rect, Splitter};
 use crate::navigation::VisualState;
 use crate::navigator::NavigatorSnapshot;
@@ -21,7 +21,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 use wgpu::util::DeviceExt;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -36,6 +36,11 @@ const TERMINAL_BOTTOM_PADDING: f32 = 10.0;
 const MAX_UI_RECTS: usize = 2_048;
 const MICHROMA_FAMILY: &str = "Michroma";
 const FACE_SWEEP_RADIANS: f32 = std::f32::consts::FRAC_PI_4;
+const NAVIGATOR_TEXTURE_WIDTH: u32 = 768;
+const NAVIGATOR_TEXTURE_HEIGHT: u32 = 1_536;
+const NAVIGATOR_TEXTURE_SCALE: f32 = 2.0;
+const NAVIGATOR_TEXTURE_LEFT: f32 = 24.0;
+const NAVIGATOR_TEXTURE_TOP: f32 = 32.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -92,6 +97,8 @@ struct Uniforms {
     secondary: [f32; 4],
     accent: [f32; 4],
     background: [f32; 4],
+    active_face: [f32; 4],
+    render_size: [f32; 4],
 }
 
 #[repr(C)]
@@ -272,14 +279,23 @@ impl PerformanceStats {
         self.text_prepare_cpu = Duration::ZERO;
     }
 
-    fn hud_text(&self, width: f32, system_load: f32, navigation_pending: bool) -> String {
-        let text = format_performance_hud(self.latest, width, system_load);
+    fn hud_text(&self, width: f32, navigation_pending: bool) -> String {
+        let text = format_performance_hud(self.latest, width);
         if navigation_pending {
             text.replacen("GIBSON // ", "GIBSON // CD PENDING // ", 1)
         } else {
             text
         }
     }
+}
+
+struct SceneTargets {
+    color_view: wgpu::TextureView,
+    color_group: wgpu::BindGroup,
+    blur_a_view: wgpu::TextureView,
+    blur_a_group: wgpu::BindGroup,
+    blur_b_view: wgpu::TextureView,
+    blur_b_group: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -290,6 +306,10 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     present_modes: Vec<wgpu::PresentMode>,
     pipeline: wgpu::RenderPipeline,
+    glass_pipeline: wgpu::RenderPipeline,
+    scene_copy_pipeline: wgpu::RenderPipeline,
+    blur_horizontal_pipeline: wgpu::RenderPipeline,
+    blur_vertical_pipeline: wgpu::RenderPipeline,
     background_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     ui_rect_pipeline: wgpu::RenderPipeline,
@@ -298,9 +318,14 @@ pub struct Renderer {
     index_count: u32,
     instance_buffer: wgpu::Buffer,
     render_objects: Vec<RenderObject>,
+    glass_objects: Vec<RenderObject>,
     instances: Vec<InstanceRaw>,
     uniform_buffer: wgpu::Buffer,
     uniform_group: wgpu::BindGroup,
+    navigator_texture_view: wgpu::TextureView,
+    navigator_texture_group: wgpu::BindGroup,
+    postprocess_texture_layout: wgpu::BindGroupLayout,
+    scene_targets: SceneTargets,
     overlay_uniform_buffer: wgpu::Buffer,
     overlay_uniform_group: wgpu::BindGroup,
     background_uniform_buffer: wgpu::Buffer,
@@ -314,8 +339,11 @@ pub struct Renderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
+    navigator_texture_viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    scene_text_renderer: TextRenderer,
+    navigator_texture_renderer: TextRenderer,
     terminal_buffer: Buffer,
     navigator_buffer: Buffer,
     metadata_buffer: Buffer,
@@ -327,6 +355,7 @@ pub struct Renderer {
     tower_label_text: Vec<String>,
     last_terminal_fingerprint: u64,
     last_navigator_fingerprint: u64,
+    navigator_texture_dirty: bool,
     last_metadata_fingerprint: u64,
     last_settings_fingerprint: u64,
     last_hud_text: String,
@@ -338,8 +367,6 @@ pub struct Renderer {
     layout: CockpitLayout,
     active_splitter: Option<Splitter>,
     navigator_hit_rect: Option<Rect>,
-    navigator_line_height: f32,
-    navigator_scale: f32,
     started: Instant,
     last_frame: Instant,
     camera_focus: Vec3,
@@ -443,9 +470,66 @@ impl Renderer {
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
+        let navigator_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tower navigator texture layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let (navigator_texture_view, navigator_texture_group) =
+            create_navigator_texture(&device, &navigator_texture_layout, format);
+        let postprocess_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("scene post-process texture layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let scene_targets = create_scene_targets(
+            &device,
+            &postprocess_texture_layout,
+            format,
+            config.width,
+            config.height,
+        );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
-            bind_group_layouts: &[Some(&uniform_layout)],
+            bind_group_layouts: &[
+                Some(&uniform_layout),
+                Some(&navigator_texture_layout),
+                Some(&postprocess_texture_layout),
+            ],
             immediate_size: 0,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -488,6 +572,83 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let glass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glass tower pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let postprocess_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene blur shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
+        });
+        let postprocess_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene post-process pipeline layout"),
+            bind_group_layouts: &[Some(&postprocess_texture_layout)],
+            immediate_size: 0,
+        });
+        let create_postprocess_pipeline = |label, entry_point| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&postprocess_layout),
+                vertex: wgpu::VertexState {
+                    module: &postprocess_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &postprocess_shader,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let scene_copy_pipeline = create_postprocess_pipeline("scene copy pipeline", "fs_copy");
+        let blur_horizontal_pipeline =
+            create_postprocess_pipeline("horizontal glass blur pipeline", "fs_horizontal");
+        let blur_vertical_pipeline =
+            create_postprocess_pipeline("vertical glass blur pipeline", "fs_vertical");
 
         let background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("theme background shader"),
@@ -708,9 +869,31 @@ impl Renderer {
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
+        let mut navigator_texture_viewport = Viewport::new(&device, &cache);
+        navigator_texture_viewport.update(
+            &queue,
+            Resolution {
+                width: NAVIGATOR_TEXTURE_WIDTH,
+                height: NAVIGATOR_TEXTURE_HEIGHT,
+            },
+        );
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let navigator_texture_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let scene_text_renderer = TextRenderer::new(
+            &mut atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+        );
         let mut terminal_buffer = Buffer::new(
             &mut font_system,
             Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT),
@@ -763,7 +946,7 @@ impl Renderer {
         hud_buffer.set_wrap(Wrap::None);
         hud_buffer.set_size(Some(config.width as f32), Some(20.0));
         hud_buffer.set_text(
-            "GIBSON // FPS -- // CPU -- // F10 (SETTINGS)",
+            "GIBSON // FPS -- // L/R ORBIT // R RESET // F2 FOCUS // F3 TERMINAL // F4 FILES // F10 SETTINGS",
             &Attrs::new().family(Family::Name(MICHROMA_FAMILY)),
             Shaping::Advanced,
             None,
@@ -792,6 +975,10 @@ impl Renderer {
             config,
             present_modes: capabilities.present_modes,
             pipeline,
+            glass_pipeline,
+            scene_copy_pipeline,
+            blur_horizontal_pipeline,
+            blur_vertical_pipeline,
             background_pipeline,
             overlay_pipeline,
             ui_rect_pipeline,
@@ -800,9 +987,14 @@ impl Renderer {
             index_count: indices.len() as u32,
             instance_buffer,
             render_objects: Vec::with_capacity(MAX_RENDER_OBJECTS),
+            glass_objects: Vec::with_capacity(128),
             instances: Vec::with_capacity(MAX_RENDER_OBJECTS + 1),
             uniform_buffer,
             uniform_group,
+            navigator_texture_view,
+            navigator_texture_group,
+            postprocess_texture_layout,
+            scene_targets,
             overlay_uniform_buffer,
             overlay_uniform_group,
             background_uniform_buffer,
@@ -816,8 +1008,11 @@ impl Renderer {
             font_system,
             swash_cache,
             viewport,
+            navigator_texture_viewport,
             atlas,
             text_renderer,
+            scene_text_renderer,
+            navigator_texture_renderer,
             terminal_buffer,
             navigator_buffer,
             metadata_buffer,
@@ -829,6 +1024,7 @@ impl Renderer {
             tower_label_text: Vec::new(),
             last_terminal_fingerprint: 0,
             last_navigator_fingerprint: 0,
+            navigator_texture_dirty: true,
             last_metadata_fingerprint: 0,
             last_settings_fingerprint: 0,
             last_hud_text: String::new(),
@@ -840,8 +1036,6 @@ impl Renderer {
             layout,
             active_splitter: None,
             navigator_hit_rect: None,
-            navigator_line_height: 17.0,
-            navigator_scale: 1.0,
             started,
             last_frame: started,
             camera_focus: Vec3::ZERO,
@@ -915,6 +1109,7 @@ impl Renderer {
     fn set_theme(&mut self, theme: OmarchyTheme, reload_background: bool) {
         self.theme = theme;
         self.last_navigator_fingerprint = u64::MAX;
+        self.navigator_texture_dirty = true;
         self.last_metadata_fingerprint = u64::MAX;
         self.last_settings_fingerprint = u64::MAX;
         self.tower_label_text.fill(String::new());
@@ -947,6 +1142,13 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth_view(&self.device, width, height);
+        self.scene_targets = create_scene_targets(
+            &self.device,
+            &self.postprocess_texture_layout,
+            self.config.format,
+            width,
+            height,
+        );
         self.recalculate_layout();
     }
 
@@ -1031,16 +1233,11 @@ impl Renderer {
     }
 
     pub fn navigator_dimensions(&self) -> (usize, usize) {
-        self.navigator_hit_rect.map_or((20, 34), |face| {
-            let scale = self.navigator_scale.max(0.1);
-            let rows = ((face.height - 16.0).max(80.0) / (self.navigator_line_height * scale))
-                .floor()
-                .clamp(8.0, 28.0) as usize;
-            let columns = ((face.width - 16.0).max(120.0) / (12.0 * 0.61 * scale))
-                .floor()
-                .clamp(24.0, 42.0) as usize;
-            (rows, columns)
-        })
+        if self.navigator_hit_rect.is_some() {
+            (28, 42)
+        } else {
+            (20, 34)
+        }
     }
 
     pub fn navigator_row_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -1048,9 +1245,9 @@ impl Renderer {
         if !pane.contains(x, y) {
             return None;
         }
-        let line = ((y - pane.y - 8.0).max(0.0)
-            / (self.navigator_line_height * self.navigator_scale.max(0.1)))
-        .floor() as usize;
+        let texture_y = (y - pane.y) / pane.height.max(1.0) * NAVIGATOR_TEXTURE_HEIGHT as f32;
+        let line = ((texture_y - NAVIGATOR_TEXTURE_TOP).max(0.0) / (17.0 * NAVIGATOR_TEXTURE_SCALE))
+            .floor() as usize;
         line.checked_sub(2)
     }
 
@@ -1083,7 +1280,6 @@ impl Renderer {
             Some((metadata_height - 18.0).max(40.0)),
         );
         self.navigator_hit_rect = None;
-        self.navigator_scale = 1.0;
         self.last_terminal_fingerprint = u64::MAX;
         self.last_navigator_fingerprint = u64::MAX;
         self.last_metadata_fingerprint = u64::MAX;
@@ -1183,6 +1379,13 @@ impl Renderer {
         let eye = camera.eye;
         let view_proj = camera.view_projection;
         let flight_intensity = camera.flight_intensity;
+        let visual_style = self.settings.appearance.visual_style;
+        let show_navigator = visual_state.shows_file_menu()
+            && self.layout_preferences.navigator_visible
+            && settings.is_none();
+        let face_panel = show_navigator
+            .then(|| scene.active_face_panel(camera.face_outward))
+            .flatten();
 
         let scene_started = Instant::now();
         let quality = self.settings.graphics.quality;
@@ -1203,6 +1406,7 @@ impl Renderer {
                 camera_focus: self.camera_focus,
                 max_objects: quality.max_objects(),
                 lightning,
+                visual_style,
             },
             &mut self.render_objects,
         );
@@ -1218,8 +1422,29 @@ impl Renderer {
             .to_cols_array_2d(),
             color: [0.004, 0.055, 0.07, 0.04],
         });
+        self.instances.extend(
+            self.render_objects
+                .iter()
+                .copied()
+                .filter(|object| !is_movie_glass(*object, visual_style))
+                .map(to_instance),
+        );
+        let opaque_instance_count = self.instances.len();
+        self.glass_objects.clear();
+        self.glass_objects.extend(
+            self.render_objects
+                .iter()
+                .copied()
+                .filter(|object| is_movie_glass(*object, visual_style)),
+        );
+        self.glass_objects.sort_by(|left, right| {
+            let left_distance = (left.model.w_axis.truncate() - eye).length_squared();
+            let right_distance = (right.model.w_axis.truncate() - eye).length_squared();
+            right_distance.total_cmp(&left_distance)
+        });
+        let glass_instance_count = self.glass_objects.len();
         self.instances
-            .extend(self.render_objects.iter().copied().map(to_instance));
+            .extend(self.glass_objects.iter().copied().map(to_instance));
         self.queue.write_buffer(
             &self.instance_buffer,
             0,
@@ -1233,21 +1458,32 @@ impl Renderer {
                 scene.command_active() as u8 as f32,
                 flight_intensity,
                 f32::from(self.settings.graphics.floor_pulses),
-                0.0,
+                match visual_style {
+                    VisualStyle::Classic => 0.0,
+                    VisualStyle::Movie1995 => 1.0,
+                },
             ],
             primary: OmarchyTheme::rgba(self.theme.cyan, 1.0),
             secondary: OmarchyTheme::rgba(self.theme.magenta, 1.0),
             accent: OmarchyTheme::rgba(self.theme.accent, 1.0),
             background: OmarchyTheme::rgba(self.theme.dark_background, 1.0),
+            active_face: [
+                camera.face_outward.x,
+                camera.face_outward.y,
+                camera.face_outward.z,
+                f32::from(show_navigator),
+            ],
+            render_size: [
+                self.config.width as f32,
+                self.config.height as f32,
+                1.0 / self.config.width.max(1) as f32,
+                1.0 / self.config.height.max(1) as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        let show_navigator = visual_state.shows_file_menu()
-            && self.layout_preferences.navigator_visible
-            && settings.is_none();
         let projected_panel = if show_navigator {
-            let panel = scene
-                .active_face_panel(camera.face_outward)
+            let panel = face_panel
                 .and_then(|panel| project_face_panel(panel, view_proj, visualiser))
                 .unwrap_or_else(|| ProjectedFacePanel::fallback(visualiser));
             Some(panel)
@@ -1255,7 +1491,6 @@ impl Renderer {
             None
         };
         self.navigator_hit_rect = projected_panel.map(ProjectedFacePanel::rect);
-        self.navigator_scale = projected_panel.map_or(1.0, |panel| panel.scale);
         let metadata_rect =
             projected_panel.map(|panel| metadata_panel(panel, navigator.selected_line, visualiser));
         let settings_rect = settings.map(|_| settings_panel(visualiser));
@@ -1287,11 +1522,7 @@ impl Renderer {
                 self.config.width,
                 self.config.height,
             ),
-            file_menu: normalized_optional(
-                projected_panel.map(ProjectedFacePanel::rect),
-                self.config.width,
-                self.config.height,
-            ),
+            file_menu: [0.0; 4],
             metadata: normalized_optional(metadata_rect, self.config.width, self.config.height),
             settings: normalized_optional(settings_rect, self.config.width, self.config.height),
             hud: hud_rect.normalized(self.config.width, self.config.height),
@@ -1319,11 +1550,12 @@ impl Renderer {
             eye,
             self.camera_focus,
             self.settings.graphics.quality.max_labels(),
+            visual_style,
         );
         let labels_cpu = labels_started.elapsed();
         let hud_text = self
             .performance
-            .hud_text(visualiser.width, system_load, navigation_pending);
+            .hud_text(visualiser.width, navigation_pending);
         let terminal_hud_text = self
             .layout
             .terminal
@@ -1348,7 +1580,12 @@ impl Renderer {
         )?;
 
         self.update_ui_rects(terminal);
-        self.draw_frame(instance_count, self.ui_rects.len(), visualiser)?;
+        self.draw_frame(
+            opaque_instance_count,
+            glass_instance_count,
+            self.ui_rects.len(),
+            visualiser,
+        )?;
         self.performance.record(
             frame_started.elapsed(),
             scene_cpu,
@@ -1401,10 +1638,12 @@ impl Renderer {
         if navigator.listing_fingerprint != self.last_navigator_fingerprint {
             let normal = Attrs::new()
                 .family(Family::Name(MICHROMA_FAMILY))
-                .color(glyph_color(self.theme.cyan));
+                .color(glyph_color(self.theme.cyan))
+                .metadata(0);
             let selected = Attrs::new()
                 .family(Family::Name(MICHROMA_FAMILY))
-                .color(glyph_color(self.theme.accent));
+                .color(glyph_color(self.theme.accent))
+                .metadata(0);
             let spans = navigator.listing.split_inclusive('\n').map(|line| {
                 if line.trim_start().starts_with('▶') {
                     (line, selected.clone())
@@ -1417,6 +1656,7 @@ impl Renderer {
             self.navigator_buffer
                 .shape_until_scroll(&mut self.font_system, false);
             self.last_navigator_fingerprint = navigator.listing_fingerprint;
+            self.navigator_texture_dirty = true;
         }
         if navigator.metadata_fingerprint != self.last_metadata_fingerprint {
             self.metadata_buffer.set_text(
@@ -1464,9 +1704,10 @@ impl Renderer {
         let terminal_content = terminal_rect.map(terminal_content_rect);
         let terminal_left = terminal_content.map_or(0.0, |rect| rect.x);
         let terminal_top = terminal_content.map_or(0.0, |rect| rect.y);
-        let mut text_areas = Vec::new();
+        let mut ui_text_areas = Vec::new();
+        let mut scene_text_areas = Vec::new();
         let hud_rect = performance_hud_rect(visualiser);
-        text_areas.push(TextArea {
+        ui_text_areas.push(TextArea {
             buffer: &self.hud_buffer,
             left: hud_rect.x + 9.0,
             top: hud_rect.y + 4.0,
@@ -1476,37 +1717,22 @@ impl Renderer {
             custom_glyphs: &[],
         });
         if settings.is_none()
-            && let Some(face_area) = projected_panel
+            && projected_panel.is_some()
+            && let Some(metadata_rect) = metadata_rect
         {
-            text_areas.push(TextArea {
-                buffer: &self.navigator_buffer,
-                left: face_area.left + 8.0,
-                top: face_area.top + 8.0,
-                scale: face_area.scale,
-                bounds: TextBounds {
-                    left: face_area.left.max(0.0) as i32,
-                    top: face_area.top.max(0.0) as i32,
-                    right: face_area.right.min(visualiser.right()) as i32,
-                    bottom: face_area.bottom.min(visualiser.bottom()) as i32,
-                },
+            ui_text_areas.push(TextArea {
+                buffer: &self.metadata_buffer,
+                left: metadata_rect.x + 10.0,
+                top: metadata_rect.y + 9.0,
+                scale: 1.0,
+                bounds: rect_bounds(metadata_rect),
                 default_color: glyph_color(self.theme.cyan),
                 custom_glyphs: &[],
             });
-            if let Some(metadata_rect) = metadata_rect {
-                text_areas.push(TextArea {
-                    buffer: &self.metadata_buffer,
-                    left: metadata_rect.x + 10.0,
-                    top: metadata_rect.y + 9.0,
-                    scale: 1.0,
-                    bounds: rect_bounds(metadata_rect),
-                    default_color: glyph_color(self.theme.cyan),
-                    custom_glyphs: &[],
-                });
-            }
         }
         if let (Some(terminal_rect), Some(terminal_content)) = (terminal_rect, terminal_content) {
             let terminal_hud = terminal_hud_rect(terminal_rect);
-            text_areas.push(TextArea {
+            ui_text_areas.push(TextArea {
                 buffer: &self.terminal_hud_buffer,
                 left: terminal_hud.x + 9.0,
                 top: terminal_hud.y + 4.0,
@@ -1520,7 +1746,7 @@ impl Renderer {
                 custom_glyphs: &[],
             });
             let terminal_bounds = rect_bounds(terminal_content);
-            text_areas.push(TextArea {
+            ui_text_areas.push(TextArea {
                 buffer: &self.terminal_buffer,
                 left: terminal_left,
                 top: terminal_top,
@@ -1529,7 +1755,7 @@ impl Renderer {
                 default_color: self.terminal_theme.foreground_color(),
                 custom_glyphs: &[],
             });
-            text_areas.push(TextArea {
+            ui_text_areas.push(TextArea {
                 buffer: &self.cursor_buffer,
                 left: terminal_left + f32::from(terminal.cursor.1) * TERMINAL_CELL_WIDTH,
                 top: terminal_top + f32::from(terminal.cursor.0) * TERMINAL_LINE_HEIGHT,
@@ -1542,7 +1768,7 @@ impl Renderer {
 
         if settings.is_none() {
             append_tower_label_areas(
-                &mut text_areas,
+                &mut scene_text_areas,
                 &self.tower_label_buffers,
                 tower_labels,
                 placement,
@@ -1552,7 +1778,7 @@ impl Renderer {
             );
         }
         if let Some(settings_rect) = settings_rect {
-            text_areas.push(TextArea {
+            ui_text_areas.push(TextArea {
                 buffer: &self.settings_buffer,
                 left: settings_rect.x + 22.0,
                 top: settings_rect.y + 18.0,
@@ -1564,13 +1790,54 @@ impl Renderer {
         }
 
         let started = Instant::now();
+        let mut scene_depths = Vec::with_capacity(tower_labels.len() + 1);
+        // The navigator belongs to the active face. Keep its glyphs above that face while
+        // tower labels use their world depth and remain hidden by nearer geometry.
+        scene_depths.push(0.0);
+        scene_depths.extend(tower_labels.iter().map(|label| {
+            project_world_depth(label.world_position, placement.view_projection).unwrap_or(0.0)
+        }));
+        if self.navigator_texture_dirty {
+            self.navigator_texture_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.navigator_texture_viewport,
+                [TextArea {
+                    buffer: &self.navigator_buffer,
+                    left: NAVIGATOR_TEXTURE_LEFT,
+                    top: NAVIGATOR_TEXTURE_TOP,
+                    scale: NAVIGATOR_TEXTURE_SCALE,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: NAVIGATOR_TEXTURE_WIDTH as i32,
+                        bottom: NAVIGATOR_TEXTURE_HEIGHT as i32,
+                    },
+                    default_color: glyph_color(self.theme.cyan),
+                    custom_glyphs: &[],
+                }],
+                &mut self.swash_cache,
+            )?;
+        }
+        self.scene_text_renderer.prepare_with_depth(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            scene_text_areas,
+            &mut self.swash_cache,
+            |metadata| scene_depths.get(metadata).copied().unwrap_or(0.0),
+        )?;
         self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            text_areas,
+            ui_text_areas,
             &mut self.swash_cache,
         )?;
         Ok(started.elapsed())
@@ -1578,7 +1845,8 @@ impl Renderer {
 
     fn draw_frame(
         &mut self,
-        instance_count: usize,
+        opaque_instance_count: usize,
+        glass_instance_count: usize,
         ui_rect_count: usize,
         visualiser: Rect,
     ) -> anyhow::Result<()> {
@@ -1609,11 +1877,47 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("GIBSON frame"),
             });
+        if self.navigator_texture_dirty {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tower navigator texture pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.navigator_texture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.navigator_texture_renderer.render(
+                &self.atlas,
+                &self.navigator_texture_viewport,
+                &mut pass,
+            )?;
+        }
+        let movie_glass = self.settings.appearance.visual_style == VisualStyle::Movie1995;
+        let (scissor_x, scissor_y, scissor_width, scissor_height) = scissor_rect(visualiser);
+        let blur_scissor = (
+            scissor_x / 2,
+            scissor_y / 2,
+            scissor_width.div_ceil(2),
+            scissor_height.div_ceil(2),
+        );
+        let scene_target = if movie_glass {
+            &self.scene_targets.color_view
+        } else {
+            &view
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene pass"),
+                label: Some("opaque scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: scene_target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1630,6 +1934,119 @@ impl Renderer {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
+                        store: if movie_glass {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(
+                visualiser.x,
+                visualiser.y,
+                visualiser.width,
+                visualiser.height,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+            pass.set_pipeline(&self.background_pipeline);
+            pass.set_bind_group(0, &self.background_texture_group, &[]);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.uniform_group, &[]);
+            pass.set_bind_group(1, &self.navigator_texture_group, &[]);
+            pass.set_bind_group(2, &self.scene_targets.blur_b_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..self.index_count, 0, 0..opaque_instance_count as u32);
+            self.scene_text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)?;
+        }
+        if movie_glass {
+            for (label, target, pipeline, source) in [
+                (
+                    "horizontal glass blur pass",
+                    &self.scene_targets.blur_a_view,
+                    &self.blur_horizontal_pipeline,
+                    &self.scene_targets.color_group,
+                ),
+                (
+                    "vertical glass blur pass",
+                    &self.scene_targets.blur_b_view,
+                    &self.blur_vertical_pipeline,
+                    &self.scene_targets.blur_a_group,
+                ),
+            ] {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, source, &[]);
+                pass.set_scissor_rect(
+                    blur_scissor.0,
+                    blur_scissor.1,
+                    blur_scissor.2,
+                    blur_scissor.3,
+                );
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene copy pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.scene_copy_pipeline);
+                pass.set_bind_group(0, &self.scene_targets.color_group, &[]);
+                pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+                pass.draw(0..3, 0..1);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("glass composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
@@ -1646,17 +2063,22 @@ impl Renderer {
                 0.0,
                 1.0,
             );
-            let (scissor_x, scissor_y, scissor_width, scissor_height) = scissor_rect(visualiser);
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-            pass.set_pipeline(&self.background_pipeline);
-            pass.set_bind_group(0, &self.background_texture_group, &[]);
-            pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.uniform_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.index_count, 0, 0..instance_count as u32);
+            if glass_instance_count > 0 {
+                pass.set_pipeline(&self.glass_pipeline);
+                pass.set_bind_group(0, &self.uniform_group, &[]);
+                pass.set_bind_group(1, &self.navigator_texture_group, &[]);
+                pass.set_bind_group(2, &self.scene_targets.blur_b_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(
+                    0..self.index_count,
+                    0,
+                    opaque_instance_count as u32
+                        ..(opaque_instance_count + glass_instance_count) as u32,
+                );
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1688,6 +2110,7 @@ impl Renderer {
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
+        self.navigator_texture_dirty = false;
         self.atlas.trim();
         Ok(())
     }
@@ -1789,7 +2212,9 @@ impl Renderer {
             buffer.set_size(Some(480.0), Some(24.0));
             buffer.set_text(
                 &label.text,
-                &Attrs::new().family(Family::Name(MICHROMA_FAMILY)),
+                &Attrs::new()
+                    .family(Family::Name(MICHROMA_FAMILY))
+                    .metadata(index + 1),
                 Shaping::Advanced,
                 None,
             );
@@ -1830,7 +2255,16 @@ fn create_background_group(
     wallpaper: Option<&Path>,
 ) -> (wgpu::BindGroup, f32, bool) {
     let decoded = wallpaper
-        .and_then(|path| image::open(path).ok())
+        .and_then(|path| match decode_wallpaper(path) {
+            Ok(image) => {
+                debug!(path = %path.display(), "loaded Omarchy wallpaper");
+                Some(image)
+            }
+            Err(error) => {
+                warn!(path = %path.display(), %error, "cannot load Omarchy wallpaper");
+                None
+            }
+        })
         .map(image::DynamicImage::into_rgba8);
     let (width, height, pixels, loaded) = decoded.map_or_else(
         || (1, 1, vec![0_u8, 0, 0, 255], false),
@@ -1889,6 +2323,124 @@ fn create_background_group(
     (group, width as f32 / height.max(1) as f32, loaded)
 }
 
+fn decode_wallpaper(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    image::ImageReader::open(path)
+        .and_then(image::ImageReader::with_guessed_format)
+        .map_err(image::ImageError::IoError)?
+        .decode()
+}
+
+fn create_navigator_texture(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> (wgpu::TextureView, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tower navigator texture"),
+        size: wgpu::Extent3d {
+            width: NAVIGATOR_TEXTURE_WIDTH,
+            height: NAVIGATOR_TEXTURE_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("tower navigator sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tower navigator texture group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (view, group)
+}
+
+fn create_scene_targets(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> SceneTargets {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("glass blur sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let create_target = |label: &'static str, width: u32, height: u32| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        (view, group)
+    };
+    let (color_view, color_group) = create_target("opaque scene texture", width, height);
+    let blur_width = width.div_ceil(2);
+    let blur_height = height.div_ceil(2);
+    let (blur_a_view, blur_a_group) =
+        create_target("horizontal glass blur texture", blur_width, blur_height);
+    let (blur_b_view, blur_b_group) =
+        create_target("vertical glass blur texture", blur_width, blur_height);
+    SceneTargets {
+        color_view,
+        color_group,
+        blur_a_view,
+        blur_a_group,
+        blur_b_view,
+        blur_b_group,
+    }
+}
+
 fn ui_rect(rect: Rect, color: [u8; 3], width: u32, height: u32) -> UiRect {
     UiRect {
         rect: rect.normalized(width, height),
@@ -1909,37 +2461,20 @@ fn performance_hud_rect(viewport: Rect) -> Rect {
     }
 }
 
-fn format_performance_hud(sample: PerformanceSample, width: f32, system_load: f32) -> String {
-    let load_percent = system_load.clamp(0.0, 1.0) * 100.0;
-    if sample.fps <= 0.0 {
-        return if width >= 1_050.0 {
-            format!(
-                "GIBSON // FPS -- // CPU -- // LOAD {load_percent:.0}% // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)"
-            )
-        } else {
-            "GIBSON // FPS -- // CPU -- // F2 (FOCUS) // F10 (SETTINGS)".to_owned()
-        };
-    }
-    if width < 680.0 {
-        format!(
-            "GIBSON // {:.0} FPS // {:.1} MS CPU // F2 (FOCUS) // F10 (SETTINGS)",
-            sample.fps, sample.frame_cpu_ms
-        )
-    } else if width < 1_050.0 {
-        format!(
-            "GIBSON // {:.1} FPS // {:.2} MS CPU // LOAD {:.0}% // {} OBJECTS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F10 (SETTINGS)",
-            sample.fps, sample.frame_cpu_ms, load_percent, sample.object_count,
-        )
+fn format_performance_hud(sample: PerformanceSample, width: f32) -> String {
+    let fps = if sample.fps > 0.0 {
+        format!("{:.1} FPS", sample.fps)
     } else {
+        "FPS --".to_owned()
+    };
+    if width >= 900.0 {
         format!(
-            "GIBSON // {:.1} FPS // {:.2} MS CPU // {:.2} MS SCENE // LOAD {:.0}% // {} OBJECTS // {} LABELS // LEFT/RIGHT (ORBIT) // R (RESET) // F2 (FOCUS) // F3 (TERMINAL) // F4 (FILES) // F10 (SETTINGS)",
-            sample.fps,
-            sample.frame_cpu_ms,
-            sample.scene_cpu_ms,
-            load_percent,
-            sample.object_count,
-            sample.label_count,
+            "GIBSON // {fps} // L/R ORBIT // R RESET // F2 FOCUS // F3 TERMINAL // F4 FILES // F10 SETTINGS"
         )
+    } else if width >= 560.0 {
+        format!("GIBSON // {fps} // L/R ORBIT // F2 FOCUS // F3 TTY // F4 FILES // F10 SETTINGS")
+    } else {
+        format!("GIBSON // {fps} // F2 FOCUS // F10 SETTINGS")
     }
 }
 
@@ -2071,7 +2606,6 @@ struct ProjectedFacePanel {
     top: f32,
     right: f32,
     bottom: f32,
-    scale: f32,
 }
 
 impl ProjectedFacePanel {
@@ -2081,7 +2615,6 @@ impl ProjectedFacePanel {
             top: viewport.y + 10.0,
             right: viewport.right() - 10.0,
             bottom: viewport.bottom() - 10.0,
-            scale: 1.0,
         }
     }
 
@@ -2104,7 +2637,10 @@ fn metadata_panel(face: ProjectedFacePanel, selected_line: usize, viewport: Rect
     } else {
         (face.left - gap - width).max(viewport.x + 8.0)
     };
-    let selected_y = face.top + 8.0 + (selected_line as f32 + 0.5) * 17.0 * face.scale;
+    let selected_texture_y =
+        NAVIGATOR_TEXTURE_TOP + (selected_line as f32 + 0.5) * 17.0 * NAVIGATOR_TEXTURE_SCALE;
+    let selected_y =
+        face.top + selected_texture_y / NAVIGATOR_TEXTURE_HEIGHT as f32 * (face.bottom - face.top);
     let y = (selected_y - height * 0.5).clamp(viewport.y + 8.0, viewport.bottom() - height - 8.0);
     Rect {
         x,
@@ -2119,6 +2655,7 @@ fn project_face_panel(
     view_projection: Mat4,
     viewport: Rect,
 ) -> Option<ProjectedFacePanel> {
+    project_world_depth(panel.center, view_projection)?;
     let half_horizontal = panel.horizontal * (panel.width * 0.5);
     let half_vertical = Vec3::Y * (panel.height * 0.5);
     let corners = [
@@ -2166,8 +2703,18 @@ fn project_face_panel(
         top,
         right,
         bottom,
-        scale: ((right - left) / 300.0).clamp(0.68, 1.0),
     })
+}
+
+fn project_world_depth(point: Vec3, view_projection: Mat4) -> Option<f32> {
+    let clip = view_projection * point.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let depth = clip.z / clip.w;
+    (0.0..=1.0)
+        .contains(&depth)
+        .then_some((depth - 0.00035).max(0.0))
 }
 
 fn project_world_point(point: Vec3, view_projection: Mat4, viewport: Rect) -> Option<(f32, f32)> {
@@ -2553,6 +3100,10 @@ fn to_instance(object: RenderObject) -> InstanceRaw {
     }
 }
 
+fn is_movie_glass(object: RenderObject, style: VisualStyle) -> bool {
+    style == VisualStyle::Movie1995 && (0.1..0.3).contains(&object.color[3])
+}
+
 fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -2648,6 +3199,38 @@ mod renderer_tests {
     use super::*;
 
     #[test]
+    fn movie_glass_classification_does_not_capture_floor_or_ui_geometry() {
+        let object = |alpha| RenderObject {
+            model: Mat4::IDENTITY,
+            color: [0.0, 0.5, 0.8, alpha],
+        };
+        assert!(is_movie_glass(object(0.18), VisualStyle::Movie1995));
+        assert!(!is_movie_glass(object(0.04), VisualStyle::Movie1995));
+        assert!(!is_movie_glass(object(1.0), VisualStyle::Movie1995));
+        assert!(!is_movie_glass(object(0.18), VisualStyle::Classic));
+    }
+
+    #[test]
+    fn wallpaper_decoder_accepts_an_extensionless_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("background");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([20, 40, 60, 255]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+
+        let decoded = decode_wallpaper(&path).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+    }
+
+    #[test]
+    fn world_text_depth_is_biased_towards_the_camera() {
+        let depth = project_world_depth(Vec3::new(0.0, 0.0, 0.5), Mat4::IDENTITY).unwrap();
+        assert!(depth < 0.5);
+        assert!(depth > 0.49);
+    }
+
+    #[test]
     fn parses_foot_hex_colors() {
         assert_eq!(parse_hex_color("#80a6b2"), Some([0x80, 0xa6, 0xb2]));
         assert_eq!(parse_hex_color("invalid"), None);
@@ -2739,19 +3322,19 @@ mod renderer_tests {
             object_count: 801,
             label_count: 8,
         };
-        let compact = format_performance_hud(sample, 480.0, 0.73);
-        let wide = format_performance_hud(sample, 1_280.0, 0.73);
+        let compact = format_performance_hud(sample, 480.0);
+        let medium = format_performance_hud(sample, 720.0);
+        let wide = format_performance_hud(sample, 1_280.0);
 
+        assert_eq!(compact, "GIBSON // 60.2 FPS // F2 FOCUS // F10 SETTINGS");
         assert_eq!(
-            compact,
-            "GIBSON // 60 FPS // 1.2 MS CPU // F2 (FOCUS) // F10 (SETTINGS)"
+            medium,
+            "GIBSON // 60.2 FPS // L/R ORBIT // F2 FOCUS // F3 TTY // F4 FILES // F10 SETTINGS"
         );
-        assert!(wide.contains("60.2 FPS"));
-        assert!(wide.contains("0.31 MS SCENE"));
-        assert!(wide.contains("LOAD 73%"));
-        assert!(wide.contains("801 OBJECTS // 8 LABELS"));
-        assert!(wide.contains("LEFT/RIGHT (ORBIT)"));
-        assert!(wide.contains("F3 (TERMINAL) // F4 (FILES)"));
+        assert_eq!(
+            wide,
+            "GIBSON // 60.2 FPS // L/R ORBIT // R RESET // F2 FOCUS // F3 TERMINAL // F4 FILES // F10 SETTINGS"
+        );
     }
 
     #[test]
