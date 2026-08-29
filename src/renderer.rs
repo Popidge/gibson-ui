@@ -3,12 +3,13 @@ use crate::layout::{CockpitLayout, LayoutPreferences, PaneTarget, Rect, Splitter
 use crate::navigation::VisualState;
 use crate::navigator::NavigatorSnapshot;
 use crate::scene::{
-    CameraSubject, FacePanel, LightningOptions, MAX_RENDER_OBJECTS, RenderObject, Scene,
-    SceneRenderContext, TowerLabel,
+    CameraSubject, FacePanel, LightningOptions, MAX_RENDER_OBJECTS, MAX_TOWER_LABELS, RenderObject,
+    Scene, ScenePalette, SceneRenderContext, TowerLabel,
 };
 use crate::system_load::SystemLoad;
 use crate::terminal::{TerminalColor, TerminalSnapshot, TerminalSpan};
 use crate::theme::OmarchyTheme;
+use crate::wallpaper::WallpaperPlacement;
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
@@ -41,6 +42,14 @@ const NAVIGATOR_TEXTURE_HEIGHT: u32 = 1_536;
 const NAVIGATOR_TEXTURE_SCALE: f32 = 2.0;
 const NAVIGATOR_TEXTURE_LEFT: f32 = 24.0;
 const NAVIGATOR_TEXTURE_TOP: f32 = 32.0;
+const TOWER_LABEL_TEXTURE_WIDTH: u32 = 1_536;
+const TOWER_LABEL_TEXTURE_HEIGHT: u32 = 2_048;
+const TOWER_LABEL_SLOT_WIDTH: u32 = 768;
+const TOWER_LABEL_SLOT_HEIGHT: u32 = 64;
+const TOWER_LABEL_CACHE_CAPACITY: usize = 64;
+const TOWER_LABEL_TEXTURE_SCALE: f32 = 2.0;
+const TOWER_LABEL_TEXTURE_PADDING: f32 = 6.0;
+const TOWER_LABEL_FACE_HYSTERESIS: f32 = 1.16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -89,6 +98,39 @@ impl InstanceRaw {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct TowerLabelInstance {
+    center_width: [f32; 4],
+    right_height: [f32; 4],
+    uv_rect: [f32; 4],
+    color: [f32; 4],
+}
+
+impl TowerLabelInstance {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        0 => Float32x4,
+        1 => Float32x4,
+        2 => Float32x4,
+        3 => Float32x4
+    ];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TowerLabelTextureInfo {
+    uv_rect: [f32; 4],
+    pixel_width: f32,
+    pixel_height: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
     camera_time: [f32; 4],
@@ -122,7 +164,9 @@ struct OverlayUniforms {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct BackgroundUniforms {
     background: [f32; 4],
+    deep_background: [f32; 4],
     options: [f32; 4],
+    monitor_uv: [f32; 4],
 }
 
 #[repr(C)]
@@ -307,6 +351,7 @@ pub struct Renderer {
     present_modes: Vec<wgpu::PresentMode>,
     pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
+    tower_label_pipeline: wgpu::RenderPipeline,
     scene_copy_pipeline: wgpu::RenderPipeline,
     blur_horizontal_pipeline: wgpu::RenderPipeline,
     blur_vertical_pipeline: wgpu::RenderPipeline,
@@ -317,13 +362,17 @@ pub struct Renderer {
     index_buffer: wgpu::Buffer,
     index_count: u32,
     instance_buffer: wgpu::Buffer,
+    tower_label_instance_buffer: wgpu::Buffer,
     render_objects: Vec<RenderObject>,
     glass_objects: Vec<RenderObject>,
     instances: Vec<InstanceRaw>,
+    tower_label_instances: Vec<TowerLabelInstance>,
     uniform_buffer: wgpu::Buffer,
     uniform_group: wgpu::BindGroup,
     navigator_texture_view: wgpu::TextureView,
     navigator_texture_group: wgpu::BindGroup,
+    tower_label_texture_view: wgpu::TextureView,
+    tower_label_texture_group: wgpu::BindGroup,
     postprocess_texture_layout: wgpu::BindGroupLayout,
     scene_targets: SceneTargets,
     overlay_uniform_buffer: wgpu::Buffer,
@@ -333,6 +382,7 @@ pub struct Renderer {
     background_texture_layout: wgpu::BindGroupLayout,
     background_image_aspect: f32,
     background_image_loaded: bool,
+    wallpaper_placement: WallpaperPlacement,
     ui_rect_buffer: wgpu::Buffer,
     ui_rects: Vec<UiRect>,
     depth_view: wgpu::TextureView,
@@ -340,10 +390,11 @@ pub struct Renderer {
     swash_cache: SwashCache,
     viewport: Viewport,
     navigator_texture_viewport: Viewport,
+    tower_label_texture_viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    scene_text_renderer: TextRenderer,
     navigator_texture_renderer: TextRenderer,
+    tower_label_texture_renderer: TextRenderer,
     terminal_buffer: Buffer,
     navigator_buffer: Buffer,
     metadata_buffer: Buffer,
@@ -353,9 +404,14 @@ pub struct Renderer {
     cursor_buffer: Buffer,
     tower_label_buffers: Vec<Buffer>,
     tower_label_text: Vec<String>,
+    tower_label_texture_info: Vec<TowerLabelTextureInfo>,
+    tower_label_slots: Vec<usize>,
+    tower_label_last_used: Vec<u64>,
+    tower_label_epoch: u64,
     last_terminal_fingerprint: u64,
     last_navigator_fingerprint: u64,
     navigator_texture_dirty: bool,
+    tower_label_texture_dirty: bool,
     last_metadata_fingerprint: u64,
     last_settings_fingerprint: u64,
     last_hud_text: String,
@@ -377,6 +433,7 @@ pub struct Renderer {
     sweep_blend: f32,
     orbit_angle: f32,
     orbit_target: f32,
+    camera_face: Vec3,
     performance: PerformanceStats,
     system_load: SystemLoad,
     adapter_name: String,
@@ -494,6 +551,8 @@ impl Renderer {
             });
         let (navigator_texture_view, navigator_texture_group) =
             create_navigator_texture(&device, &navigator_texture_layout, format);
+        let (tower_label_texture_view, tower_label_texture_group) =
+            create_tower_label_texture(&device, &navigator_texture_layout, format);
         let postprocess_texture_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("scene post-process texture layout"),
@@ -532,6 +591,12 @@ impl Renderer {
             ],
             immediate_size: 0,
         });
+        let tower_label_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tower label pipeline layout"),
+                bind_group_layouts: &[Some(&uniform_layout), Some(&navigator_texture_layout)],
+                immediate_size: 0,
+            });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
@@ -565,6 +630,47 @@ impl Renderer {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let tower_label_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tower label shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("tower_label.wgsl").into()),
+        });
+        let tower_label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tower label pipeline"),
+            layout: Some(&tower_label_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &tower_label_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(TowerLabelInstance::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &tower_label_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                // Transparent texels are discarded in the shader, so only visible glyph
+                // fragments claim depth and remain in front of their supporting glass face.
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -859,6 +965,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tower_label_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tower label instances"),
+            size: (MAX_TOWER_LABELS * mem::size_of::<TowerLabelInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let depth_view = create_depth_view(&device, config.width, config.height);
 
         let terminal_theme = TerminalTheme::load();
@@ -877,23 +989,21 @@ impl Renderer {
                 height: NAVIGATOR_TEXTURE_HEIGHT,
             },
         );
+        let mut tower_label_texture_viewport = Viewport::new(&device, &cache);
+        tower_label_texture_viewport.update(
+            &queue,
+            Resolution {
+                width: TOWER_LABEL_TEXTURE_WIDTH,
+                height: TOWER_LABEL_TEXTURE_HEIGHT,
+            },
+        );
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let navigator_texture_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let scene_text_renderer = TextRenderer::new(
-            &mut atlas,
-            &device,
-            wgpu::MultisampleState::default(),
-            Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-        );
+        let tower_label_texture_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let mut terminal_buffer = Buffer::new(
             &mut font_system,
             Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT),
@@ -976,6 +1086,7 @@ impl Renderer {
             present_modes: capabilities.present_modes,
             pipeline,
             glass_pipeline,
+            tower_label_pipeline,
             scene_copy_pipeline,
             blur_horizontal_pipeline,
             blur_vertical_pipeline,
@@ -986,13 +1097,17 @@ impl Renderer {
             index_buffer,
             index_count: indices.len() as u32,
             instance_buffer,
+            tower_label_instance_buffer,
             render_objects: Vec::with_capacity(MAX_RENDER_OBJECTS),
             glass_objects: Vec::with_capacity(128),
             instances: Vec::with_capacity(MAX_RENDER_OBJECTS + 1),
+            tower_label_instances: Vec::with_capacity(MAX_TOWER_LABELS),
             uniform_buffer,
             uniform_group,
             navigator_texture_view,
             navigator_texture_group,
+            tower_label_texture_view,
+            tower_label_texture_group,
             postprocess_texture_layout,
             scene_targets,
             overlay_uniform_buffer,
@@ -1002,6 +1117,7 @@ impl Renderer {
             background_texture_layout,
             background_image_aspect,
             background_image_loaded,
+            wallpaper_placement: WallpaperPlacement::default(),
             ui_rect_buffer,
             ui_rects: Vec::with_capacity(256),
             depth_view,
@@ -1009,10 +1125,11 @@ impl Renderer {
             swash_cache,
             viewport,
             navigator_texture_viewport,
+            tower_label_texture_viewport,
             atlas,
             text_renderer,
-            scene_text_renderer,
             navigator_texture_renderer,
+            tower_label_texture_renderer,
             terminal_buffer,
             navigator_buffer,
             metadata_buffer,
@@ -1022,9 +1139,14 @@ impl Renderer {
             cursor_buffer,
             tower_label_buffers: Vec::new(),
             tower_label_text: Vec::new(),
+            tower_label_texture_info: Vec::new(),
+            tower_label_slots: Vec::with_capacity(MAX_TOWER_LABELS),
+            tower_label_last_used: Vec::new(),
+            tower_label_epoch: 0,
             last_terminal_fingerprint: 0,
             last_navigator_fingerprint: 0,
             navigator_texture_dirty: true,
+            tower_label_texture_dirty: true,
             last_metadata_fingerprint: 0,
             last_settings_fingerprint: 0,
             last_hud_text: String::new(),
@@ -1046,6 +1168,7 @@ impl Renderer {
             sweep_blend: 0.0,
             orbit_angle: 0.0,
             orbit_target: 0.0,
+            camera_face: Vec3::NEG_Z,
             performance: PerformanceStats::new(started, settings.graphics.performance_log),
             system_load: SystemLoad::new(started),
             adapter_name,
@@ -1094,6 +1217,10 @@ impl Renderer {
         }
     }
 
+    pub fn set_wallpaper_placement(&mut self, placement: WallpaperPlacement) {
+        self.wallpaper_placement = placement;
+    }
+
     pub fn rotate_orbit(&mut self, direction: isize) -> bool {
         if !self.settings.behaviour.orbit_enabled || direction == 0 {
             return false;
@@ -1112,7 +1239,6 @@ impl Renderer {
         self.navigator_texture_dirty = true;
         self.last_metadata_fingerprint = u64::MAX;
         self.last_settings_fingerprint = u64::MAX;
-        self.tower_label_text.fill(String::new());
         if reload_background {
             self.reload_background();
         }
@@ -1350,11 +1476,12 @@ impl Renderer {
         let field_of_view = self.camera_field_of_view + flight_intensity * 7.0;
         let far_plane = (self.camera_distance * 4.0 + 120.0).max(240.0);
         let projection = Mat4::perspective_rh(field_of_view.to_radians(), aspect, 0.1, far_plane);
+        self.camera_face = tower_face_with_hysteresis(direction, self.camera_face);
         CameraFrame {
             eye,
             view_projection: projection * view,
             flight_intensity,
-            face_outward: nearest_tower_face(direction),
+            face_outward: self.camera_face,
         }
     }
 
@@ -1407,6 +1534,14 @@ impl Renderer {
                 max_objects: quality.max_objects(),
                 lightning,
                 visual_style,
+                palette: ScenePalette {
+                    primary: OmarchyTheme::rgb(self.theme.accent),
+                    secondary: OmarchyTheme::rgb(self.theme.cyan),
+                    accent: OmarchyTheme::rgb(self.theme.bright_foreground),
+                    foreground: OmarchyTheme::rgb(self.theme.foreground),
+                    subdued: OmarchyTheme::rgb(self.theme.muted),
+                    danger: OmarchyTheme::rgb(self.theme.red),
+                },
             },
             &mut self.render_objects,
         );
@@ -1463,9 +1598,9 @@ impl Renderer {
                     VisualStyle::Movie1995 => 1.0,
                 },
             ],
-            primary: OmarchyTheme::rgba(self.theme.cyan, 1.0),
-            secondary: OmarchyTheme::rgba(self.theme.magenta, 1.0),
-            accent: OmarchyTheme::rgba(self.theme.accent, 1.0),
+            primary: OmarchyTheme::rgba(self.theme.accent, 1.0),
+            secondary: OmarchyTheme::rgba(self.theme.cyan, 1.0),
+            accent: OmarchyTheme::rgba(self.theme.bright_foreground, 1.0),
             background: OmarchyTheme::rgba(self.theme.dark_background, 1.0),
             active_face: [
                 camera.face_outward.x,
@@ -1503,12 +1638,18 @@ impl Renderer {
         };
         let background_uniforms = BackgroundUniforms {
             background: OmarchyTheme::rgba(self.theme.background, 1.0),
+            deep_background: OmarchyTheme::rgba(self.theme.darker_background, 1.0),
             options: [
                 backdrop_mode,
-                visualiser.width / visualiser.height.max(1.0),
+                if self.wallpaper_placement.monitor_aspect > 0.0 {
+                    self.wallpaper_placement.monitor_aspect
+                } else {
+                    self.config.width as f32 / self.config.height.max(1) as f32
+                },
                 self.background_image_aspect,
                 f32::from(self.background_image_loaded),
             ],
+            monitor_uv: self.wallpaper_placement.monitor_uv,
         };
         self.queue.write_buffer(
             &self.background_uniform_buffer,
@@ -1532,8 +1673,8 @@ impl Renderer {
                 self.config.height,
             ),
             terminal_focus: [f32::from(terminal_focus), 0.0, 0.0, 0.0],
-            primary: OmarchyTheme::rgba(self.theme.cyan, 1.0),
-            secondary: OmarchyTheme::rgba(self.theme.accent, 1.0),
+            primary: OmarchyTheme::rgba(self.theme.accent, 1.0),
+            secondary: OmarchyTheme::rgba(self.theme.bright_foreground, 1.0),
             panel_background: OmarchyTheme::rgba(self.theme.dark_background, 1.0),
             options: [f32::from(self.settings.graphics.scanlines), 0.0, 0.0, 0.0],
         };
@@ -1638,11 +1779,11 @@ impl Renderer {
         if navigator.listing_fingerprint != self.last_navigator_fingerprint {
             let normal = Attrs::new()
                 .family(Family::Name(MICHROMA_FAMILY))
-                .color(glyph_color(self.theme.cyan))
+                .color(glyph_color(self.theme.accent))
                 .metadata(0);
             let selected = Attrs::new()
                 .family(Family::Name(MICHROMA_FAMILY))
-                .color(glyph_color(self.theme.accent))
+                .color(glyph_color(self.theme.bright_foreground))
                 .metadata(0);
             let spans = navigator.listing.split_inclusive('\n').map(|line| {
                 if line.trim_start().starts_with('▶') {
@@ -1677,7 +1818,7 @@ impl Renderer {
                 .color(glyph_color(self.theme.foreground));
             let selected = Attrs::new()
                 .family(Family::Name(MICHROMA_FAMILY))
-                .color(glyph_color(self.theme.accent));
+                .color(glyph_color(self.theme.bright_foreground));
             let spans = settings.text.split_inclusive('\n').map(|line| {
                 if line.trim_start().starts_with('▶') {
                     (line, selected.clone())
@@ -1692,6 +1833,7 @@ impl Renderer {
             self.last_settings_fingerprint = settings.fingerprint;
         }
         self.update_tower_label_text(tower_labels);
+        self.update_tower_label_instances(tower_labels, placement, settings.is_none());
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -1705,7 +1847,6 @@ impl Renderer {
         let terminal_left = terminal_content.map_or(0.0, |rect| rect.x);
         let terminal_top = terminal_content.map_or(0.0, |rect| rect.y);
         let mut ui_text_areas = Vec::new();
-        let mut scene_text_areas = Vec::new();
         let hud_rect = performance_hud_rect(visualiser);
         ui_text_areas.push(TextArea {
             buffer: &self.hud_buffer,
@@ -1713,7 +1854,7 @@ impl Renderer {
             top: hud_rect.y + 4.0,
             scale: 1.0,
             bounds: rect_bounds(hud_rect),
-            default_color: glyph_color(self.theme.cyan),
+            default_color: glyph_color(self.theme.accent),
             custom_glyphs: &[],
         });
         if settings.is_none()
@@ -1726,7 +1867,7 @@ impl Renderer {
                 top: metadata_rect.y + 9.0,
                 scale: 1.0,
                 bounds: rect_bounds(metadata_rect),
-                default_color: glyph_color(self.theme.cyan),
+                default_color: glyph_color(self.theme.accent),
                 custom_glyphs: &[],
             });
         }
@@ -1739,9 +1880,9 @@ impl Renderer {
                 scale: 1.0,
                 bounds: rect_bounds(terminal_hud),
                 default_color: glyph_color(if hud.terminal_focused {
-                    self.theme.accent
+                    self.theme.bright_foreground
                 } else {
-                    self.theme.cyan
+                    self.theme.accent
                 }),
                 custom_glyphs: &[],
             });
@@ -1766,17 +1907,6 @@ impl Renderer {
             });
         }
 
-        if settings.is_none() {
-            append_tower_label_areas(
-                &mut scene_text_areas,
-                &self.tower_label_buffers,
-                tower_labels,
-                placement,
-                glyph_color(self.theme.cyan),
-                glyph_color(self.theme.foreground),
-                glyph_color(self.theme.dark_background),
-            );
-        }
         if let Some(settings_rect) = settings_rect {
             ui_text_areas.push(TextArea {
                 buffer: &self.settings_buffer,
@@ -1790,13 +1920,6 @@ impl Renderer {
         }
 
         let started = Instant::now();
-        let mut scene_depths = Vec::with_capacity(tower_labels.len() + 1);
-        // The navigator belongs to the active face. Keep its glyphs above that face while
-        // tower labels use their world depth and remain hidden by nearer geometry.
-        scene_depths.push(0.0);
-        scene_depths.extend(tower_labels.iter().map(|label| {
-            project_world_depth(label.world_position, placement.view_projection).unwrap_or(0.0)
-        }));
         if self.navigator_texture_dirty {
             self.navigator_texture_renderer.prepare(
                 &self.device,
@@ -1815,22 +1938,45 @@ impl Renderer {
                         right: NAVIGATOR_TEXTURE_WIDTH as i32,
                         bottom: NAVIGATOR_TEXTURE_HEIGHT as i32,
                     },
-                    default_color: glyph_color(self.theme.cyan),
+                    default_color: glyph_color(self.theme.accent),
                     custom_glyphs: &[],
                 }],
                 &mut self.swash_cache,
             )?;
         }
-        self.scene_text_renderer.prepare_with_depth(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            scene_text_areas,
-            &mut self.swash_cache,
-            |metadata| scene_depths.get(metadata).copied().unwrap_or(0.0),
-        )?;
+        if self.tower_label_texture_dirty {
+            let text_areas = self
+                .tower_label_buffers
+                .iter()
+                .enumerate()
+                .map(|(index, buffer)| {
+                    let slot_x = (index as u32 % 2) * TOWER_LABEL_SLOT_WIDTH;
+                    let slot_y = (index as u32 / 2) * TOWER_LABEL_SLOT_HEIGHT;
+                    TextArea {
+                        buffer,
+                        left: slot_x as f32 + TOWER_LABEL_TEXTURE_PADDING,
+                        top: slot_y as f32 + TOWER_LABEL_TEXTURE_PADDING,
+                        scale: TOWER_LABEL_TEXTURE_SCALE,
+                        bounds: TextBounds {
+                            left: slot_x as i32,
+                            top: slot_y as i32,
+                            right: (slot_x + TOWER_LABEL_SLOT_WIDTH) as i32,
+                            bottom: (slot_y + TOWER_LABEL_SLOT_HEIGHT) as i32,
+                        },
+                        default_color: Color::rgb(255, 255, 255),
+                        custom_glyphs: &[],
+                    }
+                });
+            self.tower_label_texture_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.tower_label_texture_viewport,
+                text_areas,
+                &mut self.swash_cache,
+            )?;
+        }
         self.text_renderer.prepare(
             &self.device,
             &self.queue,
@@ -1900,6 +2046,29 @@ impl Renderer {
                 &mut pass,
             )?;
         }
+        if self.tower_label_texture_dirty {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tower label texture pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.tower_label_texture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.tower_label_texture_renderer.render(
+                &self.atlas,
+                &self.tower_label_texture_viewport,
+                &mut pass,
+            )?;
+        }
         let movie_glass = self.settings.appearance.visual_style == VisualStyle::Movie1995;
         let (scissor_x, scissor_y, scissor_width, scissor_height) = scissor_rect(visualiser);
         let blur_scissor = (
@@ -1946,6 +2115,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_pipeline(&self.background_pipeline);
+            pass.set_bind_group(0, &self.background_texture_group, &[]);
+            pass.draw(0..3, 0..1);
             pass.set_viewport(
                 visualiser.x,
                 visualiser.y,
@@ -1955,9 +2127,6 @@ impl Renderer {
                 1.0,
             );
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-            pass.set_pipeline(&self.background_pipeline);
-            pass.set_bind_group(0, &self.background_texture_group, &[]);
-            pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.uniform_group, &[]);
             pass.set_bind_group(1, &self.navigator_texture_group, &[]);
@@ -1966,8 +2135,13 @@ impl Renderer {
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..self.index_count, 0, 0..opaque_instance_count as u32);
-            self.scene_text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)?;
+            if !self.tower_label_instances.is_empty() {
+                pass.set_pipeline(&self.tower_label_pipeline);
+                pass.set_bind_group(0, &self.uniform_group, &[]);
+                pass.set_bind_group(1, &self.tower_label_texture_group, &[]);
+                pass.set_vertex_buffer(0, self.tower_label_instance_buffer.slice(..));
+                pass.draw(0..6, 0..self.tower_label_instances.len() as u32);
+            }
         }
         if movie_glass {
             for (label, target, pipeline, source) in [
@@ -2029,7 +2203,6 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.scene_copy_pipeline);
                 pass.set_bind_group(0, &self.scene_targets.color_group, &[]);
-                pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
                 pass.draw(0..3, 0..1);
             }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2111,6 +2284,7 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         self.navigator_texture_dirty = false;
+        self.tower_label_texture_dirty = false;
         self.atlas.trim();
         Ok(())
     }
@@ -2152,23 +2326,14 @@ impl Renderer {
         let content = terminal_content_rect(terminal_rect);
         let left = content.x;
         let top = content.y;
-        let width = (f32::from(terminal.columns) * TERMINAL_CELL_WIDTH).min(content.width.max(0.0));
-        let height = (f32::from(terminal.rows) * TERMINAL_LINE_HEIGHT).min(content.height.max(0.0));
-        self.ui_rects.push(ui_rect(
-            Rect {
-                x: left,
-                y: top,
-                width,
-                height,
-            },
-            self.terminal_theme.background,
-            self.config.width,
-            self.config.height,
-        ));
-        for background in terminal.backgrounds.iter().take(MAX_UI_RECTS - 1) {
+        let grid_right =
+            (left + f32::from(terminal.columns) * TERMINAL_CELL_WIDTH).min(content.right());
+        let grid_bottom =
+            (top + f32::from(terminal.rows) * TERMINAL_LINE_HEIGHT).min(content.bottom());
+        for background in terminal.backgrounds.iter().take(MAX_UI_RECTS) {
             let x = left + f32::from(background.column) * TERMINAL_CELL_WIDTH;
             let y = top + f32::from(background.row) * TERMINAL_LINE_HEIGHT;
-            if x >= content.right() || y >= content.bottom() {
+            if x >= grid_right || y >= grid_bottom {
                 continue;
             }
             let color = self
@@ -2179,8 +2344,8 @@ impl Renderer {
                     x: x.floor(),
                     y: y.floor(),
                     width: (f32::from(background.cells) * TERMINAL_CELL_WIDTH + 0.5)
-                        .min(content.right() - x),
-                    height: (TERMINAL_LINE_HEIGHT + 0.5).min(content.bottom() - y),
+                        .min(grid_right - x),
+                    height: (TERMINAL_LINE_HEIGHT + 0.5).min(grid_bottom - y),
                 },
                 color,
                 self.config.width,
@@ -2195,31 +2360,147 @@ impl Renderer {
     }
 
     fn update_tower_label_text(&mut self, labels: &[TowerLabel]) {
-        while self.tower_label_buffers.len() < labels.len() {
-            let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(15.0, 19.0));
-            buffer.set_wrap(Wrap::None);
-            self.tower_label_buffers.push(buffer);
-            self.tower_label_text.push(String::new());
-        }
-        self.tower_label_buffers.truncate(labels.len());
-        self.tower_label_text.truncate(labels.len());
+        self.tower_label_epoch = self.tower_label_epoch.wrapping_add(1).max(1);
+        self.tower_label_slots.clear();
+        let mut used_slots = Vec::with_capacity(labels.len());
 
-        for (index, label) in labels.iter().enumerate() {
-            if self.tower_label_text[index] == label.text {
+        for label in labels {
+            let cached = self
+                .tower_label_text
+                .iter()
+                .position(|text| text == &label.text);
+            let slot = cached.unwrap_or_else(|| {
+                let slot = if self.tower_label_buffers.len() < TOWER_LABEL_CACHE_CAPACITY {
+                    let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(15.0, 19.0));
+                    buffer.set_wrap(Wrap::None);
+                    self.tower_label_buffers.push(buffer);
+                    self.tower_label_text.push(String::new());
+                    self.tower_label_texture_info.push(TowerLabelTextureInfo {
+                        uv_rect: [0.0; 4],
+                        pixel_width: 1.0,
+                        pixel_height: 1.0,
+                    });
+                    self.tower_label_last_used.push(0);
+                    self.tower_label_buffers.len() - 1
+                } else {
+                    self.tower_label_last_used
+                        .iter()
+                        .enumerate()
+                        .filter(|(slot, _)| !used_slots.contains(slot))
+                        .min_by_key(|(_, used)| **used)
+                        .map(|(slot, _)| slot)
+                        .expect("label cache is larger than the visible label set")
+                };
+
+                let buffer = &mut self.tower_label_buffers[slot];
+                buffer.set_size(
+                    Some(
+                        (TOWER_LABEL_SLOT_WIDTH as f32 - TOWER_LABEL_TEXTURE_PADDING * 2.0)
+                            / TOWER_LABEL_TEXTURE_SCALE,
+                    ),
+                    Some(24.0),
+                );
+                buffer.set_text(
+                    &label.text,
+                    &Attrs::new().family(Family::Name(MICHROMA_FAMILY)),
+                    Shaping::Advanced,
+                    None,
+                );
+                buffer.shape_until_scroll(&mut self.font_system, false);
+                self.tower_label_text[slot].clone_from(&label.text);
+                let line_width = buffer
+                    .layout_runs()
+                    .map(|run| run.line_w)
+                    .fold(0.0_f32, f32::max);
+                let pixel_width = (line_width * TOWER_LABEL_TEXTURE_SCALE
+                    + TOWER_LABEL_TEXTURE_PADDING * 2.0)
+                    .clamp(1.0, TOWER_LABEL_SLOT_WIDTH as f32);
+                let pixel_height =
+                    19.0 * TOWER_LABEL_TEXTURE_SCALE + TOWER_LABEL_TEXTURE_PADDING * 2.0;
+                let slot_x = (slot as u32 % 2) * TOWER_LABEL_SLOT_WIDTH;
+                let slot_y = (slot as u32 / 2) * TOWER_LABEL_SLOT_HEIGHT;
+                self.tower_label_texture_info[slot] = TowerLabelTextureInfo {
+                    uv_rect: [
+                        slot_x as f32 / TOWER_LABEL_TEXTURE_WIDTH as f32,
+                        slot_y as f32 / TOWER_LABEL_TEXTURE_HEIGHT as f32,
+                        (slot_x as f32 + pixel_width) / TOWER_LABEL_TEXTURE_WIDTH as f32,
+                        (slot_y as f32 + pixel_height) / TOWER_LABEL_TEXTURE_HEIGHT as f32,
+                    ],
+                    pixel_width,
+                    pixel_height,
+                };
+                self.tower_label_texture_dirty = true;
+                slot
+            });
+            self.tower_label_last_used[slot] = self.tower_label_epoch;
+            self.tower_label_slots.push(slot);
+            used_slots.push(slot);
+        }
+    }
+
+    fn update_tower_label_instances(
+        &mut self,
+        labels: &[TowerLabel],
+        placement: TextPlacement,
+        visible: bool,
+    ) {
+        self.tower_label_instances.clear();
+        if !visible {
+            return;
+        }
+        let accent = OmarchyTheme::rgba(self.theme.accent, 1.0);
+        let foreground = OmarchyTheme::rgba(self.theme.foreground, 1.0);
+        let primary = [
+            (accent[0] + foreground[0] * 0.32).min(1.0),
+            (accent[1] * 1.35 + foreground[1] * 0.18).min(1.0),
+            (accent[2] * 1.35 + foreground[2] * 0.18).min(1.0),
+            1.0,
+        ];
+        let mut projected = labels
+            .iter()
+            .zip(&self.tower_label_slots)
+            .filter_map(|(label, slot)| {
+                let texture = self.tower_label_texture_info[*slot];
+                let instance = tower_label_instance(label, texture, primary, foreground);
+                let (rect, depth) = project_tower_label_instance(
+                    instance,
+                    placement.view_projection,
+                    placement.visualiser,
+                )?;
+                Some((label.current, depth, rect, instance))
+            })
+            .collect::<Vec<_>>();
+        projected.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+
+        let mut occupied = Vec::new();
+        for (_, _, rect, instance) in projected {
+            if placement
+                .projected_panel
+                .map(ProjectedFacePanel::rect)
+                .is_some_and(|panel| rects_intersect(rect, panel))
+                || placement
+                    .metadata_rect
+                    .is_some_and(|panel| rects_intersect(rect, panel))
+                || occupied
+                    .iter()
+                    .any(|occupied| rects_intersect(expand_rect(rect, 3.0), *occupied))
+            {
                 continue;
             }
-            let buffer = &mut self.tower_label_buffers[index];
-            buffer.set_size(Some(480.0), Some(24.0));
-            buffer.set_text(
-                &label.text,
-                &Attrs::new()
-                    .family(Family::Name(MICHROMA_FAMILY))
-                    .metadata(index + 1),
-                Shaping::Advanced,
-                None,
+            occupied.push(expand_rect(rect, 3.0));
+            self.tower_label_instances.push(instance);
+        }
+        if !self.tower_label_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.tower_label_instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.tower_label_instances),
             );
-            buffer.shape_until_scroll(&mut self.font_system, false);
-            self.tower_label_text[index].clone_from(&label.text);
         }
     }
 }
@@ -2361,6 +2642,52 @@ fn create_navigator_texture(
     });
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tower navigator texture group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (view, group)
+}
+
+fn create_tower_label_texture(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> (wgpu::TextureView, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tower label texture"),
+        size: wgpu::Extent3d {
+            width: TOWER_LABEL_TEXTURE_WIDTH,
+            height: TOWER_LABEL_TEXTURE_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("tower label sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tower label texture group"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -2527,6 +2854,28 @@ fn nearest_tower_face(direction: Vec3) -> Vec3 {
     }
 }
 
+fn tower_face_with_hysteresis(direction: Vec3, current: Vec3) -> Vec3 {
+    let candidate = nearest_tower_face(direction);
+    if candidate == current {
+        return current;
+    }
+    let current_strength = if current.x.abs() > 0.5 {
+        direction.x.abs()
+    } else {
+        direction.z.abs()
+    };
+    let candidate_strength = if candidate.x.abs() > 0.5 {
+        direction.x.abs()
+    } else {
+        direction.z.abs()
+    };
+    if candidate_strength > current_strength * TOWER_LABEL_FACE_HYSTERESIS {
+        candidate
+    } else {
+        current
+    }
+}
+
 fn desired_camera_pose(
     current: CameraSubject,
     state: VisualState,
@@ -2553,9 +2902,15 @@ fn desired_camera_pose(
             } else {
                 0.0
             };
+            let tracking_strength = ((current.item_count as f32 - 10.0) / 24.0).clamp(0.0, 1.0);
+            let selection_range = current.height * 0.08 * tracking_strength;
+            let width_distance = current.width * 3.15 + 2.2;
+            let framed_height = current.height + 0.9;
+            let height_distance =
+                (framed_height * 0.5 + selection_range) / (20.0_f32.to_radians().tan() * 0.94);
             CameraPose {
-                focus: current.center + Vec3::Y * (edge_offset * current.height * 0.30),
-                distance: (current.width * 3.15 + 2.2).clamp(5.4, 10.8) * zoom,
+                focus: current.center + Vec3::Y * (edge_offset * selection_range),
+                distance: width_distance.max(height_distance).clamp(5.4, 22.0) * zoom,
                 elevation: 0.035,
                 field_of_view: 40.0,
             }
@@ -2732,129 +3087,91 @@ fn project_world_point(point: Vec3, view_projection: Mat4, viewport: Rect) -> Op
     ))
 }
 
-struct ProjectedTowerLabel {
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
-    depth: f32,
-    scale: f32,
-    color: Color,
+fn tower_label_instance(
+    label: &TowerLabel,
+    texture: TowerLabelTextureInfo,
+    primary: [f32; 4],
+    foreground: [f32; 4],
+) -> TowerLabelInstance {
+    let content_world_height = if label.current { 0.34 } else { 0.27 };
+    let content_pixel_height = 19.0 * TOWER_LABEL_TEXTURE_SCALE;
+    let world_height = content_world_height * texture.pixel_height / content_pixel_height.max(1.0);
+    let world_width = world_height * texture.pixel_width / texture.pixel_height.max(1.0);
+    let right = Vec3::new(label.face_outward.z, 0.0, -label.face_outward.x)
+        .try_normalize()
+        .unwrap_or(Vec3::X);
+    TowerLabelInstance {
+        center_width: [
+            label.world_position.x,
+            label.world_position.y,
+            label.world_position.z,
+            world_width,
+        ],
+        right_height: [right.x, right.y, right.z, world_height],
+        uv_rect: texture.uv_rect,
+        color: if label.current { foreground } else { primary },
+    }
 }
 
-fn project_tower_label(
-    label: &TowerLabel,
+fn project_tower_label_instance(
+    instance: TowerLabelInstance,
     view_projection: Mat4,
     viewport: Rect,
-    primary: Color,
-    foreground: Color,
-) -> Option<ProjectedTowerLabel> {
-    let clip = view_projection * label.world_position.extend(1.0);
-    if clip.w <= 0.0 {
-        return None;
-    }
-    let ndc = clip.truncate() / clip.w;
-    if !(-1.12..=1.12).contains(&ndc.x)
-        || !(-1.12..=1.12).contains(&ndc.y)
-        || !(0.0..=1.0).contains(&ndc.z)
+) -> Option<(Rect, f32)> {
+    let center = Vec3::from_array([
+        instance.center_width[0],
+        instance.center_width[1],
+        instance.center_width[2],
+    ]);
+    let right = Vec3::from_array([
+        instance.right_height[0],
+        instance.right_height[1],
+        instance.right_height[2],
+    ]) * (instance.center_width[3] * 0.5);
+    let up = Vec3::Y * (instance.right_height[3] * 0.5);
+    let corners = [
+        center - right - up,
+        center + right - up,
+        center - right + up,
+        center + right + up,
+    ];
+    let projected = corners
+        .map(|point| project_world_point(point, view_projection, viewport))
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?;
+    let left = projected
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let right = projected
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let top = projected
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let bottom = projected
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if right < viewport.x
+        || left > viewport.right()
+        || bottom < viewport.y
+        || top > viewport.bottom()
     {
         return None;
     }
-    let x = viewport.x + (ndc.x * 0.5 + 0.5) * viewport.width;
-    let y = viewport.y + (0.5 - ndc.y * 0.5) * viewport.height;
-    let distance_scale = (18.0 / clip.w).clamp(0.68, 1.18);
-    let (base_scale, color) = if label.current {
-        (0.92, foreground)
-    } else {
-        (0.74, primary)
-    };
-    let scale = base_scale * distance_scale;
-    let text_width = label.text.chars().count() as f32 * 9.5 * scale;
-    Some(ProjectedTowerLabel {
-        left: x - text_width * 0.5,
-        top: y - 9.5 * scale,
-        width: text_width,
-        height: 19.0 * scale,
-        depth: ndc.z,
-        scale,
-        color,
-    })
-}
-
-fn append_tower_label_areas<'a>(
-    text_areas: &mut Vec<TextArea<'a>>,
-    buffers: &'a [Buffer],
-    labels: &[TowerLabel],
-    placement: TextPlacement,
-    primary: Color,
-    foreground: Color,
-    shadow: Color,
-) {
-    let mut projected = labels
-        .iter()
-        .enumerate()
-        .filter_map(|(index, label)| {
-            project_tower_label(
-                label,
-                placement.view_projection,
-                placement.visualiser,
-                primary,
-                foreground,
-            )
-            .map(|label| (index, label))
-        })
-        .collect::<Vec<_>>();
-    projected.sort_by(|(left_index, left), (right_index, right)| {
-        labels[*right_index]
-            .current
-            .cmp(&labels[*left_index].current)
-            .then_with(|| left.depth.total_cmp(&right.depth))
-    });
-
-    let city_bounds = rect_bounds(placement.visualiser);
-    let mut occupied = Vec::new();
-    for (index, label) in projected {
-        let label_rect = Rect {
-            x: label.left,
-            y: label.top,
-            width: label.width,
-            height: label.height,
-        };
-        if placement
-            .projected_panel
-            .map(ProjectedFacePanel::rect)
-            .is_some_and(|panel| rects_intersect(label_rect, panel))
-            || placement
-                .metadata_rect
-                .is_some_and(|panel| rects_intersect(label_rect, panel))
-            || occupied
-                .iter()
-                .any(|rect| rects_intersect(expand_rect(label_rect, 3.0), *rect))
-        {
-            continue;
-        }
-        occupied.push(expand_rect(label_rect, 3.0));
-        for (offset_x, offset_y) in [(-1.4, 0.0), (1.4, 0.0), (0.0, -1.4), (0.0, 1.4)] {
-            text_areas.push(TextArea {
-                buffer: &buffers[index],
-                left: label.left + offset_x,
-                top: label.top + offset_y,
-                scale: label.scale,
-                bounds: city_bounds,
-                default_color: shadow,
-                custom_glyphs: &[],
-            });
-        }
-        text_areas.push(TextArea {
-            buffer: &buffers[index],
-            left: label.left,
-            top: label.top,
-            scale: label.scale,
-            bounds: city_bounds,
-            default_color: label.color,
-            custom_glyphs: &[],
-        });
-    }
+    let depth = project_world_depth(center, view_projection)?;
+    Some((
+        Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        },
+        depth,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -3285,11 +3602,52 @@ mod renderer_tests {
     }
 
     #[test]
+    fn tower_face_hysteresis_avoids_diagonal_label_snapping() {
+        let near_diagonal = Vec3::new(0.72, 0.0, -0.70).normalize();
+        let clearly_right = Vec3::new(0.85, 0.0, -0.52).normalize();
+
+        assert_eq!(
+            tower_face_with_hysteresis(near_diagonal, Vec3::NEG_Z),
+            Vec3::NEG_Z
+        );
+        assert_eq!(
+            tower_face_with_hysteresis(clearly_right, Vec3::NEG_Z),
+            Vec3::X
+        );
+    }
+
+    #[test]
+    fn tower_label_quad_uses_shaped_texture_aspect_and_face_basis() {
+        let label = TowerLabel {
+            world_position: Vec3::new(2.0, 3.0, 4.0),
+            face_outward: Vec3::NEG_Z,
+            text: "WIDE LABEL".into(),
+            current: false,
+        };
+        let instance = tower_label_instance(
+            &label,
+            TowerLabelTextureInfo {
+                uv_rect: [0.0, 0.0, 0.25, 0.05],
+                pixel_width: 200.0,
+                pixel_height: 50.0,
+            },
+            [0.0, 1.0, 1.0, 1.0],
+            [1.0; 4],
+        );
+
+        assert_eq!(&instance.center_width[..3], &[2.0, 3.0, 4.0]);
+        assert_eq!(&instance.right_height[..3], &[-1.0, 0.0, 0.0]);
+        let aspect = instance.center_width[3] / instance.right_height[3];
+        assert!((aspect - 4.0).abs() < 0.001);
+    }
+
+    #[test]
     fn settled_view_is_closer_and_lower_than_transit() {
         let current = CameraSubject {
             center: Vec3::ZERO,
             height: 8.0,
             width: 2.0,
+            item_count: 32,
         };
         let transit = desired_camera_pose(current, VisualState::Transit, 1.0, 0.5);
         let settled = desired_camera_pose(current, VisualState::Settled, 1.0, 0.5);
@@ -3304,6 +3662,7 @@ mod renderer_tests {
             center: Vec3::ZERO,
             height: 10.0,
             width: 2.0,
+            item_count: 64,
         };
         let top = desired_camera_pose(current, VisualState::Settled, 1.0, 0.0);
         let middle = desired_camera_pose(current, VisualState::Settled, 1.0, 0.5);
@@ -3311,6 +3670,35 @@ mod renderer_tests {
 
         assert!(top.focus.y > middle.focus.y);
         assert!(bottom.focus.y < middle.focus.y);
+    }
+
+    #[test]
+    fn sparse_directories_keep_the_whole_tower_centered() {
+        let current = CameraSubject {
+            center: Vec3::new(0.0, 2.0, 0.0),
+            height: 4.0,
+            width: 1.8,
+            item_count: 2,
+        };
+        let top = desired_camera_pose(current, VisualState::Settled, 1.0, 0.0);
+        let bottom = desired_camera_pose(current, VisualState::Settled, 1.0, 1.0);
+
+        assert_eq!(top.focus, current.center);
+        assert_eq!(bottom.focus, current.center);
+    }
+
+    #[test]
+    fn settled_camera_distance_accounts_for_tower_height() {
+        let subject = |height| CameraSubject {
+            center: Vec3::ZERO,
+            height,
+            width: 2.0,
+            item_count: 64,
+        };
+        let short = desired_camera_pose(subject(4.0), VisualState::Settled, 1.0, 0.5);
+        let tall = desired_camera_pose(subject(11.5), VisualState::Settled, 1.0, 0.5);
+
+        assert!(tall.distance > short.distance * 1.8);
     }
 
     #[test]

@@ -35,9 +35,21 @@ The second release adds these systems:
 - Tower lightning that responds to system load.
 - More reliable two-way directory synchronisation.
 
+## Version 0.3
+
+The third release improves performance, scene text, camera framing, and Omarchy integration:
+
+- Cached tower-label textures in the 3D scene pipeline.
+- Stable tower identifiers for hot render-loop comparisons.
+- Correct label anchoring during orbit changes.
+- Camera framing for sparse and tall directories.
+- Full semantic palette mapping for Omarchy themes.
+- A monitor-aligned wallpaper across all GIBSON panes.
+- Cockpit workspace support for current Hyprland releases.
+
 ## Later releases
 
-The next work can improve these areas:
+Later work can improve these areas:
 
 - Text selection and clipboard support in the terminal.
 - More terminal escape-sequence and mouse support.

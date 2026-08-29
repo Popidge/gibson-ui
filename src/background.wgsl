@@ -1,6 +1,8 @@
 struct BackgroundUniforms {
     background: vec4<f32>,
+    deep_background: vec4<f32>,
     options: vec4<f32>,
+    monitor_uv: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -35,7 +37,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let mode = uniforms.options.x;
     if mode < 0.5 {
-        return vec4<f32>(0.001, 0.003, 0.011, 1.0);
+        return vec4<f32>(uniforms.deep_background.rgb, 1.0);
     }
     if mode < 1.5 || uniforms.options.w < 0.5 {
         return vec4<f32>(uniforms.background.rgb * 0.18, 1.0);
@@ -43,7 +45,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let viewport_aspect = uniforms.options.y;
     let image_aspect = uniforms.options.z;
-    var uv = input.uv;
+    var uv = uniforms.monitor_uv.xy + input.uv * uniforms.monitor_uv.zw;
     if image_aspect > viewport_aspect {
         let visible = viewport_aspect / image_aspect;
         uv.x = (uv.x - 0.5) * visible + 0.5;

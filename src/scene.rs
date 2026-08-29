@@ -11,14 +11,15 @@ const APPEAR_TIME: Duration = Duration::from_millis(620);
 const TOWER_SPACING: f32 = 5.4;
 const MAX_VISIBLE_STOREYS: usize = 72;
 const MAX_CONNECTIONS: usize = 96;
-const MAX_TOWER_LABELS: usize = 32;
+pub const MAX_TOWER_LABELS: usize = 32;
 const FILE_EFFECT_TIME: Duration = Duration::from_millis(1_100);
 const LIGHTNING_CYCLE: Duration = Duration::from_millis(620);
 pub const MAX_RENDER_OBJECTS: usize = 960;
 
 #[derive(Clone, Debug)]
 struct Tower {
-    path: PathBuf,
+    id: usize,
+    current: bool,
     name: String,
     label: String,
     position: Vec3,
@@ -49,6 +50,28 @@ pub struct LightningOptions {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct ScenePalette {
+    pub primary: [f32; 3],
+    pub secondary: [f32; 3],
+    pub accent: [f32; 3],
+    pub foreground: [f32; 3],
+    pub subdued: [f32; 3],
+    pub danger: [f32; 3],
+}
+
+impl ScenePalette {
+    #[cfg(test)]
+    const CLASSIC: Self = Self {
+        primary: [0.0, 0.83, 0.91],
+        secondary: [1.0, 0.02, 0.64],
+        accent: [0.02, 0.82, 1.0],
+        foreground: [0.34, 1.0, 0.95],
+        subdued: [0.01, 0.39, 0.75],
+        danger: [0.81, 0.03, 0.12],
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct SceneRenderContext {
     pub now: Instant,
     pub state: VisualState,
@@ -57,6 +80,7 @@ pub struct SceneRenderContext {
     pub max_objects: usize,
     pub lightning: LightningOptions,
     pub visual_style: VisualStyle,
+    pub palette: ScenePalette,
 }
 
 impl LightningOptions {
@@ -77,6 +101,7 @@ struct LightningAnimation {
 #[derive(Clone, Debug)]
 pub struct TowerLabel {
     pub world_position: Vec3,
+    pub face_outward: Vec3,
     pub text: String,
     pub current: bool,
 }
@@ -94,6 +119,7 @@ pub struct CameraSubject {
     pub center: Vec3,
     pub height: f32,
     pub width: f32,
+    pub item_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,6 +269,7 @@ pub struct Scene {
     root: PathBuf,
     towers: HashMap<PathBuf, Tower>,
     tower_order: Vec<PathBuf>,
+    next_tower_id: usize,
     flight: CameraFlight,
     command_started: Option<Instant>,
     visual_state: VisualState,
@@ -259,6 +286,7 @@ impl Scene {
             root: root.clone(),
             towers: HashMap::new(),
             tower_order: Vec::new(),
+            next_tower_id: 0,
             flight: CameraFlight::stationary(now, initial_focus, Vec3::Z, 3.6),
             command_started: None,
             visual_state: VisualState::Transit,
@@ -308,7 +336,14 @@ impl Scene {
         }
 
         if root_changed {
+            if let Some(previous) = self.towers.get_mut(&previous_root) {
+                previous.current = false;
+            }
             self.root.clone_from(&root);
+            self.towers
+                .get_mut(&root)
+                .expect("the current directory tower must exist")
+                .current = true;
         }
 
         let current = self
@@ -367,6 +402,13 @@ impl Scene {
         self.root.clone_from(&root);
         self.apply_city_layout(placements);
         self.ensure_tower(root.clone(), now);
+        if let Some(previous) = self.towers.get_mut(&previous_root) {
+            previous.current = false;
+        }
+        self.towers
+            .get_mut(&root)
+            .expect("the waypoint tower must exist")
+            .current = true;
         let target = self.focus_target();
         let world_distance = previous_focus.distance(target);
         let filesystem_distance = path_distance(&previous_root, &root) as f32 * TOWER_SPACING;
@@ -503,6 +545,7 @@ impl Scene {
                 center: self.focus_position(now),
                 height: 3.6,
                 width: 1.65,
+                item_count: 0,
             })
     }
 
@@ -522,6 +565,7 @@ impl Scene {
             camera_focus,
             max_objects,
             visual_style,
+            palette,
             ..
         } = context;
         let current_path = &self.root;
@@ -549,18 +593,22 @@ impl Scene {
             let position = tower.position + Vec3::new(0.0, scale.y * 0.5 - 0.05, 0.0);
             let model = Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, position);
             let age = now.duration_since(tower.updated).as_secs_f32();
-            let mut color = if tower.path == *current_path {
+            let mut color = if tower.current {
                 let pulse = (age * 4.0).sin().abs() * 0.12;
-                [0.015, 0.44 + pulse, 0.68 + pulse, 1.55]
+                scaled_render_color(
+                    mix_rgb(palette.primary, palette.foreground, 0.16),
+                    1.0 + pulse,
+                    1.55,
+                )
             } else if !tower.readable {
-                [0.72, 0.03, 0.24, 1.15]
+                render_color(palette.danger, 1.15)
             } else if tower.known {
-                [0.02, 0.72, 0.78, 1.25]
+                render_color(palette.primary, 1.25)
             } else {
-                [0.02, 0.31, 0.58, 0.85]
+                scaled_render_color(palette.subdued, 0.72, 0.85)
             };
             if visual_style == VisualStyle::Movie1995 {
-                color[3] = if tower.path == *current_path {
+                color[3] = if tower.current {
                     0.22
                 } else if !tower.readable {
                     0.24
@@ -581,10 +629,11 @@ impl Scene {
                     tower_height(current),
                     tower_width(current),
                     now,
+                    palette,
                 );
                 if state.shows_storeys() {
-                    add_storey_slabs(objects, current, now);
-                    add_file_effects(objects, current, &self.file_effects, now);
+                    add_storey_slabs(objects, current, now, palette);
+                    add_file_effects(objects, current, &self.file_effects, now, palette);
                 }
             }
             if state != VisualState::Settled {
@@ -603,6 +652,7 @@ impl Scene {
                             target.position,
                             current.selected == Some(entry.id),
                             now.duration_since(current.born).as_secs_f32(),
+                            palette,
                         );
                     }
                 }
@@ -611,17 +661,22 @@ impl Scene {
         self.add_system_lightning(objects, context);
         if visual_style == VisualStyle::Classic {
             for path in &self.tower_order {
-                if objects.len() >= max_objects || path == current_path {
+                if objects.len() >= max_objects {
                     continue;
                 }
-                let Some(tower) = self
-                    .towers
-                    .get(path)
-                    .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
-                else {
+                let Some(tower) = self.towers.get(path).filter(|tower| {
+                    !tower.current && self.tower_is_visible(tower, state, camera_eye, camera_focus)
+                }) else {
                     continue;
                 };
-                add_tower_bands(objects, tower, tower_height(tower), tower_width(tower), now);
+                add_tower_bands(
+                    objects,
+                    tower,
+                    tower_height(tower),
+                    tower_width(tower),
+                    now,
+                    palette,
+                );
             }
         }
         objects.truncate(max_objects);
@@ -646,31 +701,25 @@ impl Scene {
             .try_normalize()
             .unwrap_or(Vec3::NEG_Z);
         let mut labels = Vec::with_capacity(max_labels);
-        let visible_towers = self
+        let mut label_towers = self
             .towers
             .values()
             .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
             .collect::<Vec<_>>();
-        let label_towers = self
-            .towers
-            .get(&self.root)
-            .into_iter()
-            .chain(
-                self.tower_order
-                    .iter()
-                    .filter(|path| *path != &self.root)
-                    .filter_map(|path| self.towers.get(path)),
-            )
-            .take(max_labels);
+        label_towers.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| {
+                    left.position
+                        .distance_squared(camera_focus)
+                        .total_cmp(&right.position.distance_squared(camera_focus))
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
 
         for tower in label_towers {
-            if !visible_towers
-                .iter()
-                .any(|visible| std::ptr::eq(*visible, tower))
-            {
-                continue;
-            }
-            let current = tower.path == self.root;
+            let current = tower.current;
             let label_height = if visual_style == VisualStyle::Movie1995 && !current {
                 tower_height(tower) * 0.68
             } else {
@@ -679,18 +728,15 @@ impl Scene {
             let world_position = tower.position
                 + face_direction * (tower_width(tower) * 0.52 + 0.015)
                 + Vec3::Y * label_height;
-            let occluded = visible_towers.iter().any(|occluder| {
-                occluder.path != tower.path
-                    && tower_occludes_point(occluder, camera_eye, world_position)
-            });
-            if occluded {
-                continue;
-            }
             labels.push(TowerLabel {
                 world_position,
+                face_outward: face_direction,
                 text: tower.label.clone(),
                 current,
             });
+            if labels.len() == max_labels {
+                break;
+            }
         }
 
         labels
@@ -775,7 +821,7 @@ impl Scene {
         match state {
             VisualState::Transit => true,
             VisualState::Settled => {
-                if tower.path == self.root {
+                if tower.current {
                     return true;
                 }
                 // Keep the city behind and beside the active tower. Only remove a
@@ -798,11 +844,15 @@ impl Scene {
             .unwrap_or_else(|| "/".into());
         let label = compact_label(&name, 22);
         let lightning_seed = path_seed(&path);
+        let id = self.next_tower_id;
+        self.next_tower_id = self.next_tower_id.wrapping_add(1);
+        let current = path == self.root;
         self.tower_order.push(path.clone());
         self.towers.insert(
-            path.clone(),
+            path,
             Tower {
-                path,
+                id,
+                current,
                 name,
                 label,
                 position,
@@ -829,6 +879,7 @@ impl Scene {
             camera_focus,
             max_objects,
             lightning: options,
+            palette,
             ..
         } = context;
         if options.max_arcs == 0 || options.segments < 2 || self.tower_order.is_empty() {
@@ -854,14 +905,9 @@ impl Scene {
                 break;
             }
             let path = &self.tower_order[(start + offset) % self.tower_order.len()];
-            if path == &self.root {
-                continue;
-            }
-            let Some(tower) = self
-                .towers
-                .get(path)
-                .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
-            else {
+            let Some(tower) = self.towers.get(path).filter(|tower| {
+                !tower.current && self.tower_is_visible(tower, state, camera_eye, camera_focus)
+            }) else {
                 continue;
             };
             add_tower_lightning(
@@ -871,6 +917,7 @@ impl Scene {
                 options,
                 lightning_animation(tower, epoch, shape_tick, phase, envelope),
                 max_objects,
+                palette,
             );
             added += 1;
         }
@@ -885,6 +932,7 @@ impl Scene {
                 options,
                 lightning_animation(tower, epoch, shape_tick, phase, envelope),
                 max_objects,
+                palette,
             );
         }
     }
@@ -893,7 +941,7 @@ impl Scene {
         let Some(tower) = self.towers.get(&self.root) else {
             return Vec3::new(0.0, 1.8, 0.0);
         };
-        tower.position + Vec3::new(0.0, tower_height(tower) * 0.42, 0.0)
+        tower.position + Vec3::new(0.0, tower_height(tower) * 0.50, 0.0)
     }
 
     fn camera_direction_target(&self) -> Vec3 {
@@ -915,12 +963,30 @@ impl Scene {
     }
 }
 
+fn render_color(rgb: [f32; 3], alpha: f32) -> [f32; 4] {
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+fn scaled_render_color(rgb: [f32; 3], scale: f32, alpha: f32) -> [f32; 4] {
+    [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale, alpha]
+}
+
+fn mix_rgb(left: [f32; 3], right: [f32; 3], amount: f32) -> [f32; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    [
+        left[0] + (right[0] - left[0]) * amount,
+        left[1] + (right[1] - left[1]) * amount,
+        left[2] + (right[2] - left[2]) * amount,
+    ]
+}
+
 fn add_tower_bands(
     objects: &mut Vec<RenderObject>,
     tower: &Tower,
     height: f32,
     width: f32,
     now: Instant,
+    palette: ScenePalette,
 ) {
     let band_count = ((height / 0.48).round() as usize).clamp(4, 20);
     for index in 1..band_count {
@@ -934,12 +1000,17 @@ fn add_tower_bands(
                 Quat::IDENTITY,
                 tower.position + Vec3::new(0.0, y, 0.0),
             ),
-            color: [0.08, 0.55 + shimmer * 0.22, 0.92, 0.8],
+            color: scaled_render_color(palette.primary, 0.72 + shimmer * 0.24, 0.8),
         });
     }
 }
 
-fn add_storey_slabs(objects: &mut Vec<RenderObject>, tower: &Tower, now: Instant) {
+fn add_storey_slabs(
+    objects: &mut Vec<RenderObject>,
+    tower: &Tower,
+    now: Instant,
+    palette: ScenePalette,
+) {
     if tower.children.is_empty() {
         return;
     }
@@ -961,15 +1032,15 @@ fn add_storey_slabs(objects: &mut Vec<RenderObject>, tower: &Tower, now: Instant
             .sin()
             .abs();
         let color = if selected {
-            [1.0, 0.03 + pulse * 0.18, 0.74, 2.8]
+            scaled_render_color(palette.accent, 1.0 + pulse * 0.22, 2.8)
         } else if !entry.readable {
-            [1.0, 0.03, 0.12, 1.9]
+            render_color(palette.danger, 1.9)
         } else if entry.is_directory() {
-            [0.10, 0.96, 0.94, 1.65]
+            render_color(palette.primary, 1.65)
         } else if entry.hidden {
-            [0.08, 0.24, 0.38, 0.55]
+            scaled_render_color(palette.subdued, 0.42, 0.55)
         } else {
-            [0.22, 0.62, 1.0, 1.1]
+            render_color(palette.subdued, 1.1)
         };
         objects.push(RenderObject {
             model: Mat4::from_scale_rotation_translation(
@@ -991,6 +1062,7 @@ fn add_file_effects(
     tower: &Tower,
     effects: &[FileEffect],
     now: Instant,
+    palette: ScenePalette,
 ) {
     let count = tower.children.len().max(
         effects
@@ -1020,7 +1092,7 @@ fn add_file_effects(
                         Quat::from_rotation_y(progress * 2.4),
                         tower.position + Vec3::new(width * 0.66, beam_height * 0.5, width * 0.66),
                     ),
-                    color: [0.05, 0.95, 0.72, 2.8 * envelope],
+                    color: scaled_render_color(palette.primary, 1.2, 2.8 * envelope),
                 });
                 objects.push(RenderObject {
                     model: Mat4::from_scale_rotation_translation(
@@ -1028,7 +1100,7 @@ fn add_file_effects(
                         Quat::from_rotation_y(progress * 0.32),
                         tower.position + Vec3::new(0.0, to_y, 0.0),
                     ),
-                    color: [0.05, 1.0, 0.68, 2.5 * envelope],
+                    color: scaled_render_color(palette.primary, 1.35, 2.5 * envelope),
                 });
             }
             FileEffectKind::Remove => {
@@ -1043,7 +1115,7 @@ fn add_file_effects(
                         Quat::from_rotation_y(progress * 0.9),
                         tower.position + Vec3::new(0.0, from_y - progress * 0.45, 0.0),
                     ),
-                    color: [1.0, 0.02, 0.34, 2.7 * envelope],
+                    color: scaled_render_color(palette.danger, 1.3, 2.7 * envelope),
                 });
             }
             FileEffectKind::Rename => {
@@ -1055,7 +1127,7 @@ fn add_file_effects(
                         Quat::IDENTITY,
                         tower.position + Vec3::new(0.0, (from_y + to_y) * 0.5, 0.0),
                     ),
-                    color: [0.82, 0.08, 1.0, 2.1 * envelope],
+                    color: scaled_render_color(palette.secondary, 1.2, 2.1 * envelope),
                 });
                 objects.push(RenderObject {
                     model: Mat4::from_scale_rotation_translation(
@@ -1063,7 +1135,7 @@ fn add_file_effects(
                         Quat::from_rotation_y(progress * 4.0),
                         tower.position + Vec3::new(0.0, y, width * 0.68),
                     ),
-                    color: [1.0, 0.12, 0.82, 3.2 * envelope],
+                    color: scaled_render_color(palette.accent, 1.35, 3.2 * envelope),
                 });
             }
             FileEffectKind::Modify => {
@@ -1080,7 +1152,7 @@ fn add_file_effects(
                                     (phase + offset).sin() * width * 0.72,
                                 ),
                         ),
-                        color: [0.15, 0.72, 1.0, 2.6 * envelope],
+                        color: scaled_render_color(palette.secondary, 1.3, 2.6 * envelope),
                     });
                 }
             }
@@ -1114,6 +1186,7 @@ fn add_connection(
     to: Vec3,
     selected: bool,
     elapsed: f32,
+    palette: ScenePalette,
 ) {
     let delta = to - from;
     let flat = Vec3::new(delta.x, 0.0, delta.z);
@@ -1131,9 +1204,9 @@ fn add_connection(
             midpoint,
         ),
         color: if selected {
-            [1.0, 0.02, 0.72, 2.3]
+            scaled_render_color(palette.accent, 1.2, 2.3)
         } else {
-            [0.02, 0.46, 0.88, 0.75]
+            render_color(palette.subdued, 0.75)
         },
     });
 
@@ -1145,7 +1218,7 @@ fn add_connection(
                 Quat::IDENTITY,
                 from.lerp(to, phase) + Vec3::new(0.0, 0.18, 0.0),
             ),
-            color: [0.65, 0.96, 1.0, 3.2],
+            color: scaled_render_color(palette.foreground, 1.25, 3.2),
         });
     }
 }
@@ -1157,6 +1230,7 @@ fn add_tower_lightning(
     options: LightningOptions,
     animation: LightningAnimation,
     max_objects: usize,
+    palette: ScenePalette,
 ) {
     let LightningOptions { load, segments, .. } = options;
     let LightningAnimation {
@@ -1180,9 +1254,9 @@ fn add_tower_lightning(
     let center_offset = (random_unit(seed.rotate_left(15)) - 0.5) * width * 0.25;
     let surface = tower.position + normal * (width * 0.51 + 0.045);
     let color = if seed & 2 == 0 {
-        [0.86, 0.98, 1.0]
+        mix_rgb(palette.foreground, palette.primary, 0.35)
     } else {
-        [1.0, 0.08, 0.68]
+        mix_rgb(palette.accent, palette.secondary, 0.45)
     };
     let thickness = 0.032 + load * 0.038;
     let mut previous = surface + tangent * center_offset + Vec3::Y * start_y;
@@ -1303,9 +1377,10 @@ fn camera_subject(tower: &Tower, animated_center: Option<Vec3>) -> CameraSubject
     let width = tower_width(tower);
     CameraSubject {
         center: animated_center
-            .unwrap_or_else(|| tower.position + Vec3::new(0.0, height * 0.42, 0.0)),
+            .unwrap_or_else(|| tower.position + Vec3::new(0.0, height * 0.50, 0.0)),
         height,
         width,
+        item_count: tower.children.len(),
     }
 }
 
@@ -1338,6 +1413,7 @@ fn tower_blocks_view(
     )
 }
 
+#[cfg(test)]
 fn tower_occludes_point(tower: &Tower, camera_eye: Vec3, point: Vec3) -> bool {
     let ray = point - camera_eye;
     let distance = ray.length();
@@ -1483,6 +1559,33 @@ mod tests {
     }
 
     #[test]
+    fn tower_labels_prioritize_the_current_and_nearest_visible_towers() {
+        let now = Instant::now();
+        let root = PathBuf::from("/label-priority/root");
+        let far = PathBuf::from("/label-priority/far");
+        let near = PathBuf::from("/label-priority/near");
+        let mut scene = Scene::new(root.clone());
+        scene.ensure_tower(far.clone(), now);
+        scene.ensure_tower(near.clone(), now);
+        scene.towers.get_mut(&root).unwrap().position = Vec3::ZERO;
+        scene.towers.get_mut(&far).unwrap().position = Vec3::new(100.0, 0.0, 0.0);
+        scene.towers.get_mut(&near).unwrap().position = Vec3::new(4.0, 0.0, 0.0);
+
+        let labels = scene.tower_labels(
+            Vec3::NEG_Z,
+            VisualState::Transit,
+            Vec3::new(0.0, 5.0, -10.0),
+            Vec3::ZERO,
+            2,
+            VisualStyle::Movie1995,
+        );
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].text, "ROOT");
+        assert_eq!(labels[1].text, "NEAR");
+    }
+
+    #[test]
     fn directory_symlinks_remain_file_entries() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("target")).unwrap();
@@ -1564,6 +1667,7 @@ mod tests {
             max_objects: MAX_RENDER_OBJECTS,
             lightning: LightningOptions::OFF,
             visual_style,
+            palette: ScenePalette::CLASSIC,
         };
         let mut classic = Vec::new();
         let mut movie = Vec::new();
@@ -1599,6 +1703,7 @@ mod tests {
                 seed: 42,
             },
             10,
+            ScenePalette::CLASSIC,
         );
 
         assert_eq!(objects.len(), 10);
@@ -1780,8 +1885,14 @@ mod tests {
         let mut scene = Scene::new(root.clone());
         scene.update(root, scan_directory(temp.path()).unwrap(), &[]);
         let before = scene.towers.get(&child).unwrap().position;
+        assert!(scene.towers.get(scene.root()).unwrap().current);
         scene.update(child.clone(), scan_directory(&child).unwrap(), &[]);
         assert_eq!(scene.towers.get(&child).unwrap().position, before);
+        assert!(scene.towers.get(&child).unwrap().current);
+        assert_eq!(
+            scene.towers.values().filter(|tower| tower.current).count(),
+            1
+        );
     }
 
     #[test]

@@ -11,11 +11,12 @@ pub struct OmarchyTheme {
     pub name: String,
     pub background: [u8; 3],
     pub dark_background: [u8; 3],
+    pub darker_background: [u8; 3],
     pub foreground: [u8; 3],
+    pub bright_foreground: [u8; 3],
     pub accent: [u8; 3],
+    pub muted: [u8; 3],
     pub cyan: [u8; 3],
-    pub blue: [u8; 3],
-    pub magenta: [u8; 3],
     pub red: [u8; 3],
     pub wallpaper: Option<PathBuf>,
     fingerprint: u64,
@@ -61,12 +62,13 @@ impl OmarchyTheme {
         Self {
             name,
             background: color(&values, "background", [0x28, 0x25, 0x21]),
-            dark_background: color(&values, "darker_background", [0x00, 0x03, 0x0b]),
+            dark_background: color(&values, "dark_background", [0x00, 0x03, 0x0b]),
+            darker_background: color(&values, "darker_background", [0x00, 0x01, 0x08]),
             foreground: color(&values, "foreground", [0xd6, 0xc9, 0xad]),
+            bright_foreground: color(&values, "bright_foreground", [0xf1, 0xdf, 0xc0]),
             accent: color(&values, "accent", [0xd7, 0xa9, 0x3d]),
+            muted: color(&values, "muted", [0x6b, 0x5a, 0x3b]),
             cyan: color(&values, "cyan", [0x00, 0xeb, 0xf5]),
-            blue: color(&values, "blue", [0x1f, 0xa7, 0xe0]),
-            magenta: color(&values, "magenta", [0xff, 0x26, 0xd2]),
             red: color(&values, "red", [0xe8, 0x30, 0x62]),
             wallpaper,
             fingerprint: hasher.finish(),
@@ -74,15 +76,18 @@ impl OmarchyTheme {
     }
 
     pub fn classic() -> Self {
+        // Classic mode feeds the same semantic mapping as an Omarchy theme:
+        // accent -> primary, cyan -> secondary, bright foreground -> highlight.
         Self {
             name: "GIBSON 1995".into(),
             background: [0x00, 0x08, 0x18],
             dark_background: [0x00, 0x01, 0x08],
+            darker_background: [0x00, 0x01, 0x08],
             foreground: [0x9d, 0xff, 0xf9],
-            accent: [0x2a, 0xe9, 0xff],
-            cyan: [0x00, 0xeb, 0xf5],
-            blue: [0x1f, 0xa7, 0xe0],
-            magenta: [0xff, 0x26, 0xd2],
+            bright_foreground: [0x2a, 0xe9, 0xff],
+            accent: [0x00, 0xeb, 0xf5],
+            muted: [0x1f, 0xa7, 0xe0],
+            cyan: [0xff, 0x26, 0xd2],
             red: [0xe8, 0x30, 0x62],
             wallpaper: None,
             fingerprint: 0,
@@ -96,6 +101,11 @@ impl OmarchyTheme {
             srgb_to_linear(color[2]),
             alpha,
         ]
+    }
+
+    pub fn rgb(color: [u8; 3]) -> [f32; 3] {
+        let [red, green, blue, _] = Self::rgba(color, 1.0);
+        [red, green, blue]
     }
 }
 
@@ -191,6 +201,10 @@ mod tests {
     fn classic_palette_is_independent_of_omarchy_state() {
         let palette = OmarchyTheme::classic();
         assert_eq!(palette.name, "GIBSON 1995");
+        assert_eq!(palette.accent, [0x00, 0xeb, 0xf5]);
+        assert_eq!(palette.cyan, [0xff, 0x26, 0xd2]);
+        assert_eq!(palette.bright_foreground, [0x2a, 0xe9, 0xff]);
+        assert_eq!(palette.muted, [0x1f, 0xa7, 0xe0]);
         assert!(palette.wallpaper.is_none());
     }
 }
