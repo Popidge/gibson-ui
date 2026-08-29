@@ -4,6 +4,8 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+- Added a checksum-verified installer for the latest GitHub release.
+
 ## 0.3.0 - 2026-08-29
 
 - Fixed cockpit mode on Hyprland 0.55 and later.

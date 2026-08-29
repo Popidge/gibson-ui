@@ -22,7 +22,25 @@ GIBSON targets [Omarchy](https://omarchy.org/) first. It also runs on other Arch
 
 ## Install
 
-Install the official GitHub release with the included Arch package recipe:
+Install the latest official GitHub release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Popidge/gibson-ui/main/install.sh | bash
+```
+
+The script verifies the release checksum and installs GIBSON in `~/.local`. Run the same command to update GIBSON.
+
+The script does not register the installation with `pacman`.
+
+To examine the script before installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Popidge/gibson-ui/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+You can also install the release with the included Arch package recipe:
 
 ```bash
 sudo pacman -S --needed base-devel git
@@ -31,7 +49,7 @@ cd gibson-ui/packaging/aur
 makepkg -si
 ```
 
-This recipe installs the release binary with the complete Mixkit soundscape. It does not compile the application.
+Both methods install the release binary with the complete Mixkit soundscape. They do not compile the application.
 
 AUR publication is planned when new account registrations are available again. Registration is temporarily closed.
 
