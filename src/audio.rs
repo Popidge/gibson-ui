@@ -66,6 +66,7 @@ pub struct Soundscape {
     flying: bool,
     focused: bool,
     enabled: bool,
+    music_paused: bool,
     master_volume: f32,
     variation: u32,
     last_health_check: Instant,
@@ -103,6 +104,7 @@ impl Soundscape {
             flying: false,
             focused: true,
             enabled: true,
+            music_paused: false,
             master_volume: 1.0,
             variation: 0,
             last_health_check: Instant::now(),
@@ -238,6 +240,16 @@ impl Soundscape {
         } else {
             Decibels(20.0 * self.master_volume.log10())
         };
+        let paused = volume == Decibels::SILENCE;
+        if paused != self.music_paused {
+            // Muting the output alone leaves the streaming decoder and mixer running.
+            if paused {
+                self.music.pause(tween(duration));
+            } else {
+                self.music.resume(tween(duration));
+            }
+            self.music_paused = paused;
+        }
         self.manager
             .main_track()
             .set_volume(volume, tween(duration));
@@ -273,6 +285,32 @@ fn tween(duration: Duration) -> Tween {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a live audio output device"]
+    fn muted_music_stops_advancing_and_resumes() {
+        use kira::sound::PlaybackState;
+
+        let mut soundscape = Soundscape::new().unwrap();
+        for reason in 0..3 {
+            match reason {
+                0 => soundscape.apply_settings(false, 0.01),
+                1 => soundscape.set_focused(false),
+                _ => soundscape.apply_settings(true, 0.0),
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(soundscape.music.state(), PlaybackState::Paused);
+            let paused_position = soundscape.music.position();
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(soundscape.music.position(), paused_position);
+
+            soundscape.apply_settings(true, 0.01);
+            soundscape.set_focused(true);
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(soundscape.music.state(), PlaybackState::Playing);
+            assert!(soundscape.music.position() > paused_position);
+        }
+    }
 
     #[test]
     fn embedded_sound_assets_decode() {

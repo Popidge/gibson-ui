@@ -5,7 +5,7 @@ The largest measured reductions affect text preparation and label selection. Who
 
 Measurements used a Ryzen 5 PRO 4650U, integrated Radeon graphics, Mesa RADV 26.2.1, Rust 1.94.0, and the release build.
 The fullscreen surface was 1920 × 1080. The tests used isolated settings and the repository directory as the starting location.
-Both builds used the same GPU timing instrumentation. Kernel sampling with `perf` was unavailable on this machine.
+Both builds used the same GPU timing instrumentation. The initial pass lacked `perf`. The sampled CPU follow-up below uses the subsequently installed tool.
 
 The CPU microbenchmark creates 256 directories and measures repeated operations after initial preparation:
 
@@ -82,3 +82,60 @@ cargo run --frozen --release -- --uncapped --perf /path/to/directory
 
 For comparable runs, use the same directory, surface size, settings, and power conditions. Exclude startup records.
 GPU logs contain zero values for passes that did not run. Direct-copy timing also requires encoder timestamp support.
+
+Sampled CPU follow-up
+
+The follow-up compares commit `d74cfd1` with the changes below. Both binaries use optimized release code with debug information and frame pointers:
+
+```bash
+cargo rustc --frozen --release -- -C debuginfo=1 -C strip=none -C force-frame-pointers=yes
+perf record -p PID -e cycles:u -F 499 --call-graph dwarf,16384 -o /tmp/gibson.data -- sleep 15
+perf stat -p PID -e task-clock:u,cycles:u,instructions:u,cache-misses:u -- sleep 15
+```
+
+The existing `perf_event_paranoid=2` permits these user-space samples. No kernel restrictions or system settings changed.
+Samples cover application threads, including audio and driver workers. Some distribution libraries lack symbols, which limits their call-stack detail.
+GPU pass timestamps provide the separate graphics measurements. These CPU samples do not measure GPU execution or kernel work.
+
+Each workload uses fullscreen film mode at 60 FPS, disabled audio, and a stationary scene without lightning or floor pulses.
+Sampling starts after six seconds and lasts fifteen seconds. The terminal producer runs in a separate process outside the sampled application.
+The idle workload displays a static shell. The terminal workload emits 2,000 colored log lines per second in batches of forty.
+The navigation workload changes directory every 400 milliseconds across 32 directories with 64 files each, modifying sixteen files per change.
+It exercises shell directory notifications, filesystem watches, navigation, and rendering.
+
+Muted music still decoded and mixed in the baseline. The soundscape now pauses its music stream while disabled, unfocused, or at zero volume.
+It resumes from that position when audible again. Existing volume fades remain. The audio backend remains open to support prompt resumption.
+
+Terminal changes previously rebuilt the entire rich-text buffer. The renderer now replaces rows individually and retains shaping for unchanged text and attributes.
+Regression coverage compares text, styles, and glyph positions against the previous rich-text path, including Unicode, blank rows, trailing newlines, and row removal.
+It also checks that unchanged rows retain their shaping cache.
+
+Two comparisons ran in opposite build order. The table shows their mean totals over each fifteen-second sampling period.
+
+| Workload | CPU time before → after | CPU time reduction | User-space instructions before → after |
+|---|---:|---:|---:|
+| Idle | 2.271 → 2.182 seconds | 4% | 1.166 → 0.855 billion |
+| Terminal output | 5.452 → 3.979 seconds | 27% | 13.455 → 7.598 billion |
+| Navigation | 3.120 → 2.855 seconds | 9% | 3.848 → 2.909 billion |
+
+Terminal output used 43–44% fewer instructions in both comparisons. Its mean logged frame CPU time fell from 3.96 to 2.54 milliseconds.
+All workloads stayed near the configured 60 FPS. These measurements establish CPU savings, not an uncapped FPS gain or a battery-life result.
+The small idle CPU-time change illustrates the remaining rendering and backend costs despite 27% fewer user-space instructions.
+
+In the initial terminal sample, font metrics accounted for 11% of sampled cycles and attribute lookup accounted for 9%.
+After the changes, the first comparison showed about 5% for each, against a smaller total cycle count.
+Glyph preparation remains a prominent navigation cost. A broader rendering-cache change lacks sufficient evidence to justify its additional invalidation rules here.
+User-space sampling found actionable changes without relaxed kernel restrictions. Kernel behavior remains unmeasured.
+
+The audio integration check requires a live output device and remains explicitly ignored during normal test runs:
+
+```bash
+cargo test --frozen muted_music_stops_advancing_and_resumes -- --ignored --nocapture
+```
+
+It checks disabled audio, lost focus, and zero volume. Each case verifies paused playback, a stationary stream position, and successful resumption.
+Raw samples, generated workloads, isolated settings, and screenshots remain outside the repository under `/tmp`.
+
+Follow-up validation passed: 80 normal tests, the explicit live audio integration check, formatting, strict Clippy, and the frozen release build.
+The normal suite skips the timing benchmark and the hardware audio check. Sampling reported no lost events in any of the twelve captures.
+The release smoke sequence passed terminal output, selection, orbit, settings, pane visibility, and fullscreen resizing with no logged renderer errors.

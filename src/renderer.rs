@@ -14,8 +14,9 @@ use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
+    Attrs, AttrsList, Buffer, BufferLine, Cache, Color, Family, FontSystem, Metrics, Resolution,
+    Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Wrap,
 };
 use std::fs;
 use std::mem;
@@ -2378,20 +2379,7 @@ impl Renderer {
                 });
             self.terminal_buffer
                 .set_size(Some(terminal_width), Some(terminal_height));
-            let family_name = self.terminal_theme.font_family.clone();
-            let default_attrs = Attrs::new().family(Family::Name(&family_name));
-            let spans = terminal
-                .spans
-                .iter()
-                .map(|span| {
-                    (
-                        span.text.as_str(),
-                        self.terminal_theme.attrs(span, &family_name),
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.terminal_buffer
-                .set_rich_text(spans, &default_attrs, Shaping::Basic, None);
+            update_terminal_lines(&mut self.terminal_buffer, terminal, &self.terminal_theme);
             self.terminal_buffer
                 .shape_until_scroll(&mut self.font_system, false);
             self.last_terminal_fingerprint = terminal.fingerprint;
@@ -2581,6 +2569,50 @@ impl Renderer {
             );
         }
     }
+}
+
+fn update_terminal_lines(buffer: &mut Buffer, terminal: &TerminalSnapshot, theme: &TerminalTheme) {
+    use glyphon::cosmic_text::LineEnding;
+
+    let defaults = Attrs::new().family(Family::Name(&theme.font_family));
+    let mut text = String::new();
+    let mut attrs = AttrsList::new(&defaults);
+    let mut row = 0;
+    let mut finish_line = |text: &mut String, attrs: &mut AttrsList| {
+        let attrs = mem::replace(attrs, AttrsList::new(&defaults));
+        if let Some(line) = buffer.lines.get_mut(row) {
+            // Preserve shaping and layout for rows whose text and style did not change.
+            line.set_text(&*text, LineEnding::Lf, attrs);
+        } else {
+            buffer.lines.push(BufferLine::new(
+                text.clone(),
+                LineEnding::Lf,
+                attrs,
+                Shaping::Basic,
+            ));
+        }
+        text.clear();
+        row += 1;
+    };
+    for span in &terminal.spans {
+        let style = theme.attrs(span, &theme.font_family);
+        for part in span.text.split_inclusive('\n') {
+            let content = part.strip_suffix('\n').unwrap_or(part);
+            let start = text.len();
+            text.push_str(content);
+            if style != defaults {
+                attrs.add_span(start..text.len(), &style);
+            }
+            if part.ends_with('\n') {
+                finish_line(&mut text, &mut attrs);
+            }
+        }
+    }
+    if !text.is_empty() || terminal.spans.iter().all(|span| span.text.is_empty()) {
+        finish_line(&mut text, &mut attrs);
+    }
+    buffer.lines.truncate(row);
+    buffer.set_redraw(true);
 }
 
 fn select_present_mode(
@@ -3585,6 +3617,91 @@ fn cube_mesh() -> (Vec<Vertex>, Vec<u16>) {
 #[cfg(test)]
 mod renderer_tests {
     use super::*;
+
+    #[test]
+    fn terminal_row_updates_preserve_rich_text_and_remove_old_rows() {
+        use crate::terminal::TerminalSpan;
+
+        let mut fonts = FontSystem::new();
+        let theme = TerminalTheme::default();
+        let mut incremental = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
+        let mut reference = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
+        incremental.set_size(Some(800.0), Some(600.0));
+        reference.set_size(Some(800.0), Some(600.0));
+        let mut snapshot = TerminalSnapshot {
+            spans: vec![TerminalSpan {
+                text: "stable row\n\nλ 界 ".into(),
+                foreground: TerminalColor::Default,
+                background: TerminalColor::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            }],
+            backgrounds: vec![],
+            fingerprint: 0,
+            cursor: (0, 0),
+            rows: 3,
+            columns: 80,
+        };
+        let mut colored = snapshot.spans[0].clone();
+        colored.text = "colored".into();
+        colored.foreground = TerminalColor::Indexed(3);
+        colored.bold = true;
+        colored.underline = true;
+        snapshot.spans.push(colored);
+        for (index, replacement) in ["colored", "changed", "changed", "", "tail\n"]
+            .into_iter()
+            .enumerate()
+        {
+            snapshot.spans[1].text = replacement.into();
+            snapshot.spans[1].foreground = TerminalColor::Indexed(3 + index as u8);
+            update_terminal_lines(&mut incremental, &snapshot, &theme);
+            if replacement != "colored" {
+                assert!(incremental.lines[0].shape_opt().is_some());
+                assert!(incremental.lines[2].shape_opt().is_none());
+            }
+            let defaults = Attrs::new().family(Family::Name(&theme.font_family));
+            reference.set_rich_text(
+                snapshot
+                    .spans
+                    .iter()
+                    .map(|span| (span.text.as_str(), theme.attrs(span, &theme.font_family))),
+                &defaults,
+                Shaping::Basic,
+                None,
+            );
+            incremental.shape_until_scroll(&mut fonts, false);
+            reference.shape_until_scroll(&mut fonts, false);
+            assert_eq!(incremental.lines.len(), reference.lines.len());
+            for (actual, expected) in incremental.lines.iter().zip(&reference.lines) {
+                assert_eq!(actual.text(), expected.text());
+                for offset in 0..actual.text().len() {
+                    assert_eq!(
+                        actual.attrs_list().get_span(offset),
+                        expected.attrs_list().get_span(offset)
+                    );
+                }
+            }
+            let glyphs = |buffer: &Buffer| {
+                buffer
+                    .layout_runs()
+                    .flat_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .map(|g| (g.start, g.end, g.x, g.y, g.w, g.color_opt, g.metadata))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(glyphs(&incremental), glyphs(&reference));
+        }
+        snapshot.spans.truncate(1);
+        snapshot.spans[0].text = "short".into();
+        update_terminal_lines(&mut incremental, &snapshot, &theme);
+        assert_eq!(incremental.lines.len(), 1);
+        assert_eq!(incremental.lines[0].text(), "short");
+    }
 
     #[test]
     fn metadata_text_does_not_move_for_subpixel_camera_drift() {
