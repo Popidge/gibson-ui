@@ -10,7 +10,7 @@ This project uses [Semantic Versioning](https://semver.org/).
 - Reduced film-mode scene-copy costs on supported graphics devices.
 - Paused inaudible music to avoid unnecessary decoding and mixing.
 - Added optional GPU pass timings to performance logging.
-- Fixed terminal snapshot consistency during concurrent output.
+- Fixed terminal snapshot consistency during concurrent output and first-row text shaping.
 - Fixed Unicode color parsing and restored classic file-change effects.
 - Removed dead rendering code and simplified hot paths.
 - Added a checksum-verified installer for the latest GitHub release.

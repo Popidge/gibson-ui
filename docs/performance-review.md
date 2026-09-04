@@ -139,3 +139,7 @@ Raw samples, generated workloads, isolated settings, and screenshots remain outs
 Follow-up validation passed: 80 normal tests, the explicit live audio integration check, formatting, strict Clippy, and the frozen release build.
 The normal suite skips the timing benchmark and the hardware audio check. Sampling reported no lost events in any of the twelve captures.
 The release smoke sequence passed terminal output, selection, orbit, settings, pane visibility, and fullscreen resizing with no logged renderer errors.
+
+Release validation found that the default text buffer gave the first row Advanced shaping while later rows used Basic shaping.
+The terminal now starts with an empty buffer, so every row uses Basic shaping.
+The regression test uses the bundled proportional font to expose shaping differences independently of installed system fonts.

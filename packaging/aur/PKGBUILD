@@ -17,7 +17,7 @@ provides=("gibson-ui=$pkgver")
 conflicts=('gibson-ui')
 options=('!debug')
 source_x86_64=("gibson-ui-$pkgver-x86_64.tar.zst::$url/releases/download/v$pkgver/gibson-ui-$pkgver-x86_64.tar.zst")
-sha256sums_x86_64=('e6ddbe794ea1193df7b80e381df8eb14a7e81a3be671ea657a86abeb1c5e1bf1')
+sha256sums_x86_64=('de6587ba1f974570aa22a330bbb3e4d494fe0dd2eb09e539a59727288fc5525e')
 
 package() {
   local release_dir="$srcdir/gibson-ui-$pkgver-$CARCH"

@@ -1023,10 +1023,9 @@ impl Renderer {
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let tower_label_texture_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let mut terminal_buffer = Buffer::new(
-            &mut font_system,
-            Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT),
-        );
+        // The row updater creates Basic-shaped lines; Buffer::new seeds an Advanced line.
+        let mut terminal_buffer =
+            Buffer::new_empty(Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT));
         terminal_buffer.set_wrap(Wrap::None);
         terminal_buffer.set_monospace_width(Some(TERMINAL_CELL_WIDTH));
         let mut cursor_buffer = Buffer::new(
@@ -3622,9 +3621,15 @@ mod renderer_tests {
     fn terminal_row_updates_preserve_rich_text_and_remove_old_rows() {
         use crate::terminal::TerminalSpan;
 
-        let mut fonts = FontSystem::new();
-        let theme = TerminalTheme::default();
-        let mut incremental = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
+        // Use one bundled face so host font fallback cannot change this comparison.
+        let mut database = glyphon::fontdb::Database::new();
+        database.load_font_data(include_bytes!("../assets/fonts/Michroma-Regular.ttf").to_vec());
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), database);
+        let theme = TerminalTheme {
+            font_family: MICHROMA_FAMILY.into(),
+            ..TerminalTheme::default()
+        };
+        let mut incremental = Buffer::new_empty(Metrics::new(14.0, 18.0));
         let mut reference = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
         incremental.set_size(Some(800.0), Some(600.0));
         reference.set_size(Some(800.0), Some(600.0));
