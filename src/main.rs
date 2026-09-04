@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod filesystem;
+mod gpu_profile;
 mod layout;
 mod navigation;
 mod navigator;
@@ -1025,3 +1026,6 @@ mod tests {
         assert_eq!(navigation.take_queued(true), Some(second));
     }
 }
+
+#[cfg(test)]
+mod performance_tests;

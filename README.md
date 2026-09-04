@@ -244,6 +244,12 @@ The HUD shows the frame rate and the main controls.
 
 Use `--perf` to print detailed frame statistics every two seconds.
 
+On supported GPUs, `--perf` also samples GPU pass times without waiting for the GPU.
+The CPU frame time includes surface acquisition and presentation overhead.
+GPU pass times measure GPU execution only.
+
+Run the CPU benchmarks with `cargo test --frozen --release profile_hot_paths -- --ignored --nocapture`.
+
 ## Privacy and safety
 
 GIBSON does not send paths, commands, terminal output, or file names over the network.

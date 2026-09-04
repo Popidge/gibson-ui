@@ -175,9 +175,9 @@ fn color(values: &toml::Table, key: &str, fallback: [u8; 3]) -> [u8; 3] {
         .unwrap_or(fallback)
 }
 
-fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+pub(crate) fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
     let value = value.trim().trim_start_matches('#');
-    if value.len() != 6 {
+    if value.len() != 6 || !value.is_ascii() {
         return None;
     }
     Some([
@@ -195,6 +195,9 @@ mod tests {
     fn parses_six_digit_theme_colors() {
         assert_eq!(parse_hex_color("#d7a93d"), Some([0xd7, 0xa9, 0x3d]));
         assert_eq!(parse_hex_color("invalid"), None);
+        for malformed in ["aé123", "中123", "abcdefg", "#12xx34"] {
+            assert_eq!(parse_hex_color(malformed), None);
+        }
     }
 
     #[test]

@@ -6,7 +6,6 @@ struct VertexOutput {
 struct OverlayUniforms {
     visualiser: vec4<f32>,
     terminal: vec4<f32>,
-    file_menu: vec4<f32>,
     metadata: vec4<f32>,
     settings: vec4<f32>,
     hud: vec4<f32>,
@@ -83,17 +82,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 + overlay.primary.rgb * border * 0.34
                 + vec3<f32>(scan),
             0.985,
-        );
-    }
-
-    if inside(input.uv, overlay.file_menu) {
-        let border = rect_edge(input.uv, overlay.file_menu);
-        let scan = overlay.options.x * 0.010 * sin(input.uv.y * 1150.0);
-        return vec4<f32>(
-            overlay.panel_background.rgb * 0.24
-                + overlay.primary.rgb * border * 0.28
-                + vec3<f32>(scan),
-            0.97,
         );
     }
 
