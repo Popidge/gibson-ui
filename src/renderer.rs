@@ -8,14 +8,15 @@ use crate::scene::{
 };
 use crate::system_load::SystemLoad;
 use crate::terminal::{TerminalColor, TerminalSnapshot, TerminalSpan};
-use crate::theme::OmarchyTheme;
+use crate::theme::{OmarchyTheme, parse_hex_color};
 use crate::wallpaper::WallpaperPlacement;
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
+    Attrs, AttrsList, Buffer, BufferLine, Cache, Color, Family, FontSystem, Metrics, Resolution,
+    Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Wrap,
 };
 use std::fs;
 use std::mem;
@@ -148,7 +149,6 @@ struct Uniforms {
 struct OverlayUniforms {
     visualiser: [f32; 4],
     terminal: [f32; 4],
-    file_menu: [f32; 4],
     metadata: [f32; 4],
     settings: [f32; 4],
     hud: [f32; 4],
@@ -210,6 +210,19 @@ struct TextPlacement {
     view_projection: Mat4,
     visualiser: Rect,
     projected_panel: Option<ProjectedFacePanel>,
+    metadata_rect: Option<Rect>,
+    settings_rect: Option<Rect>,
+}
+
+#[derive(PartialEq)]
+struct UiTextState {
+    terminal_fingerprint: u64,
+    metadata_fingerprint: u64,
+    settings_fingerprint: Option<u64>,
+    hud: String,
+    terminal_hud: Option<String>,
+    terminal_focused: bool,
+    cursor: (u16, u16),
     metadata_rect: Option<Rect>,
     settings_rect: Option<Rect>,
 }
@@ -436,7 +449,9 @@ pub struct Renderer {
     camera_face: Vec3,
     performance: PerformanceStats,
     system_load: SystemLoad,
+    ui_text_state: Option<UiTextState>,
     adapter_name: String,
+    gpu_profile: Option<crate::gpu_profile::GpuProfile>,
     window: Arc<Window>,
 }
 
@@ -472,6 +487,9 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("GIBSON device"),
+                required_features: adapter.features()
+                    & (wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                 ..Default::default()
             })
             .await
@@ -488,7 +506,8 @@ impl Renderer {
             select_present_mode(&capabilities.present_modes, settings.graphics.frame_rate)
                 .context("surface exposes no presentation modes")?;
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | (capabilities.usages & wgpu::TextureUsages::COPY_DST),
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -1004,10 +1023,9 @@ impl Renderer {
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let tower_label_texture_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let mut terminal_buffer = Buffer::new(
-            &mut font_system,
-            Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT),
-        );
+        // The row updater creates Basic-shaped lines; Buffer::new seeds an Advanced line.
+        let mut terminal_buffer =
+            Buffer::new_empty(Metrics::new(TERMINAL_FONT_SIZE, TERMINAL_LINE_HEIGHT));
         terminal_buffer.set_wrap(Wrap::None);
         terminal_buffer.set_monospace_width(Some(TERMINAL_CELL_WIDTH));
         let mut cursor_buffer = Buffer::new(
@@ -1077,6 +1095,7 @@ impl Renderer {
         let layout = CockpitLayout::calculate(config.width, config.height, layout_preferences);
 
         let started = Instant::now();
+        let gpu_profile = crate::gpu_profile::GpuProfile::new(&device);
         Ok(Self {
             instance,
             surface,
@@ -1171,7 +1190,9 @@ impl Renderer {
             camera_face: Vec3::NEG_Z,
             performance: PerformanceStats::new(started, settings.graphics.performance_log),
             system_load: SystemLoad::new(started),
+            ui_text_state: None,
             adapter_name,
+            gpu_profile,
             window,
         })
     }
@@ -1203,7 +1224,7 @@ impl Renderer {
             } else {
                 OmarchyTheme::classic()
             };
-            self.set_theme(theme, true);
+            self.set_theme(theme);
         } else if backdrop_changed {
             self.reload_background();
         }
@@ -1211,9 +1232,10 @@ impl Renderer {
 
     pub fn apply_omarchy_theme(&mut self, theme: &OmarchyTheme) {
         self.terminal_theme = TerminalTheme::load();
+        self.ui_text_state = None;
         self.last_terminal_fingerprint = u64::MAX;
         if self.settings.appearance.follow_omarchy {
-            self.set_theme(theme.clone(), true);
+            self.set_theme(theme.clone());
         }
     }
 
@@ -1233,15 +1255,14 @@ impl Renderer {
         self.orbit_target = 0.0;
     }
 
-    fn set_theme(&mut self, theme: OmarchyTheme, reload_background: bool) {
+    fn set_theme(&mut self, theme: OmarchyTheme) {
+        self.ui_text_state = None;
         self.theme = theme;
         self.last_navigator_fingerprint = u64::MAX;
         self.navigator_texture_dirty = true;
         self.last_metadata_fingerprint = u64::MAX;
         self.last_settings_fingerprint = u64::MAX;
-        if reload_background {
-            self.reload_background();
-        }
+        self.reload_background();
     }
 
     fn reload_background(&mut self) {
@@ -1393,6 +1414,7 @@ impl Renderer {
     }
 
     fn recalculate_layout(&mut self) {
+        self.ui_text_state = None;
         self.layout = CockpitLayout::calculate(
             self.config.width,
             self.config.height,
@@ -1493,6 +1515,25 @@ impl Renderer {
         status: RenderStatus<'_>,
     ) -> anyhow::Result<()> {
         let frame_started = Instant::now();
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                self.window.request_redraw();
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                self.surface.configure(&self.device, &self.config);
+                self.window.request_redraw();
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface = self.instance.create_surface(self.window.clone())?;
+                self.surface.configure(&self.device, &self.config);
+                self.window.request_redraw();
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => anyhow::bail!("surface validation error"),
+        };
         let RenderStatus {
             terminal_focused: terminal_focus,
             navigation_pending,
@@ -1545,7 +1586,6 @@ impl Renderer {
             },
             &mut self.render_objects,
         );
-        self.render_objects.truncate(quality.max_objects());
         let instance_count = self.render_objects.len() + 1;
         self.instances.clear();
         self.instances.push(InstanceRaw {
@@ -1557,21 +1597,15 @@ impl Renderer {
             .to_cols_array_2d(),
             color: [0.004, 0.055, 0.07, 0.04],
         });
-        self.instances.extend(
-            self.render_objects
-                .iter()
-                .copied()
-                .filter(|object| !is_movie_glass(*object, visual_style))
-                .map(to_instance),
-        );
-        let opaque_instance_count = self.instances.len();
         self.glass_objects.clear();
-        self.glass_objects.extend(
-            self.render_objects
-                .iter()
-                .copied()
-                .filter(|object| is_movie_glass(*object, visual_style)),
-        );
+        for &object in &self.render_objects {
+            if is_movie_glass(object, visual_style) {
+                self.glass_objects.push(object);
+            } else {
+                self.instances.push(to_instance(object));
+            }
+        }
+        let opaque_instance_count = self.instances.len();
         self.glass_objects.sort_by(|left, right| {
             let left_distance = (left.model.w_axis.truncate() - eye).length_squared();
             let right_distance = (right.model.w_axis.truncate() - eye).length_squared();
@@ -1663,7 +1697,6 @@ impl Renderer {
                 self.config.width,
                 self.config.height,
             ),
-            file_menu: [0.0; 4],
             metadata: normalized_optional(metadata_rect, self.config.width, self.config.height),
             settings: normalized_optional(settings_rect, self.config.width, self.config.height),
             hud: hud_rect.normalized(self.config.width, self.config.height),
@@ -1722,6 +1755,7 @@ impl Renderer {
 
         self.update_ui_rects(terminal);
         self.draw_frame(
+            frame,
             opaque_instance_count,
             glass_instance_count,
             self.ui_rects.len(),
@@ -1751,6 +1785,17 @@ impl Renderer {
         let projected_panel = placement.projected_panel;
         let metadata_rect = placement.metadata_rect;
         let settings_rect = placement.settings_rect;
+        let ui_text_state = UiTextState {
+            terminal_fingerprint: terminal.fingerprint,
+            metadata_fingerprint: navigator.metadata_fingerprint,
+            settings_fingerprint: settings.map(|snapshot| snapshot.fingerprint),
+            hud: hud.visualiser.to_owned(),
+            terminal_hud: hud.terminal.map(str::to_owned),
+            terminal_focused: hud.terminal_focused,
+            cursor: terminal.cursor,
+            metadata_rect,
+            settings_rect,
+        };
         self.update_terminal_text(terminal);
         if self.last_hud_text != hud.visualiser {
             self.hud_buffer.set_text(
@@ -1977,47 +2022,40 @@ impl Renderer {
                 &mut self.swash_cache,
             )?;
         }
-        self.text_renderer.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            ui_text_areas,
-            &mut self.swash_cache,
-        )?;
+        // Any atlas allocation can evict cached UI glyphs, so refresh after either
+        // offscreen text renderer prepares new content as well as on UI changes.
+        if self.ui_text_state.as_ref() != Some(&ui_text_state)
+            || self.navigator_texture_dirty
+            || self.tower_label_texture_dirty
+        {
+            self.text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                ui_text_areas,
+                &mut self.swash_cache,
+            )?;
+            self.ui_text_state = Some(ui_text_state);
+        }
         Ok(started.elapsed())
     }
 
     fn draw_frame(
         &mut self,
+        frame: wgpu::SurfaceTexture,
         opaque_instance_count: usize,
         glass_instance_count: usize,
         ui_rect_count: usize,
         visualiser: Rect,
     ) -> anyhow::Result<()> {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
-                self.surface.configure(&self.device, &self.config);
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface = self.instance.create_surface(self.window.clone())?;
-                self.surface.configure(&self.device, &self.config);
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => anyhow::bail!("surface validation error"),
-        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(profile) = &mut self.gpu_profile {
+            profile.begin_frame(&self.device, &self.queue, self.performance.log_enabled);
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2036,7 +2074,10 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(0)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2059,7 +2100,10 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(1)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2111,7 +2155,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(2)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2144,7 +2191,7 @@ impl Renderer {
             }
         }
         if movie_glass {
-            for (label, target, pipeline, source) in [
+            for (index, (label, target, pipeline, source)) in [
                 (
                     "horizontal glass blur pass",
                     &self.scene_targets.blur_a_view,
@@ -2157,7 +2204,10 @@ impl Renderer {
                     &self.blur_vertical_pipeline,
                     &self.scene_targets.blur_a_group,
                 ),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2170,7 +2220,10 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(3 + index)),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -2184,7 +2237,19 @@ impl Renderer {
                 );
                 pass.draw(0..3, 0..1);
             }
-            {
+            if self.config.usage.contains(wgpu::TextureUsages::COPY_DST) {
+                if let Some(profile) = &mut self.gpu_profile {
+                    profile.copy_timestamp(&mut encoder, false);
+                }
+                encoder.copy_texture_to_texture(
+                    self.scene_targets.color_view.texture().as_image_copy(),
+                    frame.texture.as_image_copy(),
+                    frame.texture.size(),
+                );
+                if let Some(profile) = &mut self.gpu_profile {
+                    profile.copy_timestamp(&mut encoder, true);
+                }
+            } else {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene copy pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2197,7 +2262,10 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(5)),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -2224,7 +2292,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(6)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2266,7 +2337,10 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(7)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2281,7 +2355,13 @@ impl Renderer {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)?;
         }
+        if let Some(profile) = &self.gpu_profile {
+            profile.resolve(&mut encoder);
+        }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(profile) = &mut self.gpu_profile {
+            profile.submitted();
+        }
         self.queue.present(frame);
         self.navigator_texture_dirty = false;
         self.tower_label_texture_dirty = false;
@@ -2298,20 +2378,7 @@ impl Renderer {
                 });
             self.terminal_buffer
                 .set_size(Some(terminal_width), Some(terminal_height));
-            let family_name = self.terminal_theme.font_family.clone();
-            let default_attrs = Attrs::new().family(Family::Name(&family_name));
-            let spans = terminal
-                .spans
-                .iter()
-                .map(|span| {
-                    (
-                        span.text.as_str(),
-                        self.terminal_theme.attrs(span, &family_name),
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.terminal_buffer
-                .set_rich_text(spans, &default_attrs, Shaping::Basic, None);
+            update_terminal_lines(&mut self.terminal_buffer, terminal, &self.terminal_theme);
             self.terminal_buffer
                 .shape_until_scroll(&mut self.font_system, false);
             self.last_terminal_fingerprint = terminal.fingerprint;
@@ -2362,7 +2429,6 @@ impl Renderer {
     fn update_tower_label_text(&mut self, labels: &[TowerLabel]) {
         self.tower_label_epoch = self.tower_label_epoch.wrapping_add(1).max(1);
         self.tower_label_slots.clear();
-        let mut used_slots = Vec::with_capacity(labels.len());
 
         for label in labels {
             let cached = self
@@ -2386,7 +2452,7 @@ impl Renderer {
                     self.tower_label_last_used
                         .iter()
                         .enumerate()
-                        .filter(|(slot, _)| !used_slots.contains(slot))
+                        .filter(|(slot, _)| !self.tower_label_slots.contains(slot))
                         .min_by_key(|(_, used)| **used)
                         .map(|(slot, _)| slot)
                         .expect("label cache is larger than the visible label set")
@@ -2434,7 +2500,6 @@ impl Renderer {
             });
             self.tower_label_last_used[slot] = self.tower_label_epoch;
             self.tower_label_slots.push(slot);
-            used_slots.push(slot);
         }
     }
 
@@ -2503,6 +2568,50 @@ impl Renderer {
             );
         }
     }
+}
+
+fn update_terminal_lines(buffer: &mut Buffer, terminal: &TerminalSnapshot, theme: &TerminalTheme) {
+    use glyphon::cosmic_text::LineEnding;
+
+    let defaults = Attrs::new().family(Family::Name(&theme.font_family));
+    let mut text = String::new();
+    let mut attrs = AttrsList::new(&defaults);
+    let mut row = 0;
+    let mut finish_line = |text: &mut String, attrs: &mut AttrsList| {
+        let attrs = mem::replace(attrs, AttrsList::new(&defaults));
+        if let Some(line) = buffer.lines.get_mut(row) {
+            // Preserve shaping and layout for rows whose text and style did not change.
+            line.set_text(&*text, LineEnding::Lf, attrs);
+        } else {
+            buffer.lines.push(BufferLine::new(
+                text.clone(),
+                LineEnding::Lf,
+                attrs,
+                Shaping::Basic,
+            ));
+        }
+        text.clear();
+        row += 1;
+    };
+    for span in &terminal.spans {
+        let style = theme.attrs(span, &theme.font_family);
+        for part in span.text.split_inclusive('\n') {
+            let content = part.strip_suffix('\n').unwrap_or(part);
+            let start = text.len();
+            text.push_str(content);
+            if style != defaults {
+                attrs.add_span(start..text.len(), &style);
+            }
+            if part.ends_with('\n') {
+                finish_line(&mut text, &mut attrs);
+            }
+        }
+    }
+    if !text.is_empty() || terminal.spans.iter().all(|span| span.text.is_empty()) {
+        finish_line(&mut text, &mut attrs);
+    }
+    buffer.lines.truncate(row);
+    buffer.set_redraw(true);
 }
 
 fn select_present_mode(
@@ -2731,7 +2840,9 @@ fn create_scene_targets(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2997,6 +3108,9 @@ fn metadata_panel(face: ProjectedFacePanel, selected_line: usize, viewport: Rect
     let selected_y =
         face.top + selected_texture_y / NAVIGATOR_TEXTURE_HEIGHT as f32 * (face.bottom - face.top);
     let y = (selected_y - height * 0.5).clamp(viewport.y + 8.0, viewport.bottom() - height - 8.0);
+    // Pixel-aligned UI text stays sharp and avoids rebuilding glyphs for subpixel camera drift.
+    let x = x.round();
+    let y = y.round();
     Rect {
         x,
         y,
@@ -3394,18 +3508,6 @@ fn expand_home(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
-    let value = value.trim().trim_start_matches('#');
-    if value.len() != 6 {
-        return None;
-    }
-    Some([
-        u8::from_str_radix(&value[0..2], 16).ok()?,
-        u8::from_str_radix(&value[2..4], 16).ok()?,
-        u8::from_str_radix(&value[4..6], 16).ok()?,
-    ])
-}
-
 fn cube_component(value: u8) -> u8 {
     if value == 0 { 0 } else { value * 40 + 55 }
 }
@@ -3514,6 +3616,125 @@ fn cube_mesh() -> (Vec<Vertex>, Vec<u16>) {
 #[cfg(test)]
 mod renderer_tests {
     use super::*;
+
+    #[test]
+    fn terminal_row_updates_preserve_rich_text_and_remove_old_rows() {
+        use crate::terminal::TerminalSpan;
+
+        // Use one bundled face so host font fallback cannot change this comparison.
+        let mut database = glyphon::fontdb::Database::new();
+        database.load_font_data(include_bytes!("../assets/fonts/Michroma-Regular.ttf").to_vec());
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), database);
+        let theme = TerminalTheme {
+            font_family: MICHROMA_FAMILY.into(),
+            ..TerminalTheme::default()
+        };
+        let mut incremental = Buffer::new_empty(Metrics::new(14.0, 18.0));
+        let mut reference = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
+        incremental.set_size(Some(800.0), Some(600.0));
+        reference.set_size(Some(800.0), Some(600.0));
+        let mut snapshot = TerminalSnapshot {
+            spans: vec![TerminalSpan {
+                text: "stable row\n\nλ 界 ".into(),
+                foreground: TerminalColor::Default,
+                background: TerminalColor::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+            }],
+            backgrounds: vec![],
+            fingerprint: 0,
+            cursor: (0, 0),
+            rows: 3,
+            columns: 80,
+        };
+        let mut colored = snapshot.spans[0].clone();
+        colored.text = "colored".into();
+        colored.foreground = TerminalColor::Indexed(3);
+        colored.bold = true;
+        colored.underline = true;
+        snapshot.spans.push(colored);
+        for (index, replacement) in ["colored", "changed", "changed", "", "tail\n"]
+            .into_iter()
+            .enumerate()
+        {
+            snapshot.spans[1].text = replacement.into();
+            snapshot.spans[1].foreground = TerminalColor::Indexed(3 + index as u8);
+            update_terminal_lines(&mut incremental, &snapshot, &theme);
+            if replacement != "colored" {
+                assert!(incremental.lines[0].shape_opt().is_some());
+                assert!(incremental.lines[2].shape_opt().is_none());
+            }
+            let defaults = Attrs::new().family(Family::Name(&theme.font_family));
+            reference.set_rich_text(
+                snapshot
+                    .spans
+                    .iter()
+                    .map(|span| (span.text.as_str(), theme.attrs(span, &theme.font_family))),
+                &defaults,
+                Shaping::Basic,
+                None,
+            );
+            incremental.shape_until_scroll(&mut fonts, false);
+            reference.shape_until_scroll(&mut fonts, false);
+            assert_eq!(incremental.lines.len(), reference.lines.len());
+            for (actual, expected) in incremental.lines.iter().zip(&reference.lines) {
+                assert_eq!(actual.text(), expected.text());
+                for offset in 0..actual.text().len() {
+                    assert_eq!(
+                        actual.attrs_list().get_span(offset),
+                        expected.attrs_list().get_span(offset)
+                    );
+                }
+            }
+            let glyphs = |buffer: &Buffer| {
+                buffer
+                    .layout_runs()
+                    .flat_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .map(|g| (g.start, g.end, g.x, g.y, g.w, g.color_opt, g.metadata))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(glyphs(&incremental), glyphs(&reference));
+        }
+        snapshot.spans.truncate(1);
+        snapshot.spans[0].text = "short".into();
+        update_terminal_lines(&mut incremental, &snapshot, &theme);
+        assert_eq!(incremental.lines.len(), 1);
+        assert_eq!(incremental.lines[0].text(), "short");
+    }
+
+    #[test]
+    fn metadata_text_does_not_move_for_subpixel_camera_drift() {
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 1080.0,
+        };
+        let face = ProjectedFacePanel {
+            left: 300.0,
+            top: 100.0,
+            right: 600.0,
+            bottom: 700.0,
+        };
+        let panel = metadata_panel(face, 2, viewport);
+        let drifted = metadata_panel(
+            ProjectedFacePanel {
+                right: face.right + 0.01,
+                ..face
+            },
+            2,
+            viewport,
+        );
+        assert_eq!(panel, drifted);
+        assert!(panel.width > 0.0 && panel.height > 0.0);
+        assert!(panel.right() <= viewport.right());
+    }
 
     #[test]
     fn movie_glass_classification_does_not_capture_floor_or_ui_geometry() {

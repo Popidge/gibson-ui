@@ -6,6 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 const PREVIEW_CHILD_LIMIT: usize = 12;
@@ -49,10 +50,6 @@ struct PreviewResult {
     result: Result<Vec<String>, String>,
 }
 
-enum PreviewCommand {
-    Inspect(PreviewRequest),
-}
-
 /// A conventional file list. It owns selection and preview state; the 3D scene does not.
 pub struct Navigator {
     root: PathBuf,
@@ -61,8 +58,9 @@ pub struct Navigator {
     last_window_start: usize,
     generation: u64,
     preview: Preview,
-    command_tx: Sender<PreviewCommand>,
+    command_tx: Sender<PreviewRequest>,
     result_rx: Receiver<PreviewResult>,
+    snapshot_cache: Option<(usize, usize, bool, Arc<NavigatorSnapshot>)>,
 }
 
 impl Navigator {
@@ -82,6 +80,7 @@ impl Navigator {
             preview: Preview::Empty,
             command_tx,
             result_rx,
+            snapshot_cache: None,
         };
         navigator.request_preview();
         Ok(navigator)
@@ -105,6 +104,7 @@ impl Navigator {
             {
                 continue;
             }
+            self.snapshot_cache = None;
             self.preview = match result.result {
                 Ok(lines) => Preview::Ready {
                     path: result.path,
@@ -172,9 +172,19 @@ impl Navigator {
         self.selected_entry().map(|entry| entry.id)
     }
 
-    pub fn snapshot(&mut self, rows: usize, columns: usize, focused: bool) -> NavigatorSnapshot {
+    pub fn snapshot(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        focused: bool,
+    ) -> Arc<NavigatorSnapshot> {
         let rows = rows.max(8);
         let columns = columns.max(24);
+        if let Some((cached_rows, cached_columns, cached_focus, snapshot)) = &self.snapshot_cache
+            && (*cached_rows, *cached_columns, *cached_focus) == (rows, columns, focused)
+        {
+            return Arc::clone(snapshot);
+        }
         let list_budget = rows.saturating_sub(3).max(2);
         let count = self.item_count();
         let overflow = count > list_budget;
@@ -217,7 +227,7 @@ impl Navigator {
         listing.hash(&mut listing_hasher);
         let mut metadata_hasher = DefaultHasher::new();
         metadata.hash(&mut metadata_hasher);
-        NavigatorSnapshot {
+        let snapshot = Arc::new(NavigatorSnapshot {
             listing,
             listing_fingerprint: listing_hasher.finish(),
             metadata,
@@ -228,7 +238,9 @@ impl Navigator {
             } else {
                 self.cursor as f32 / (count - 1) as f32
             },
-        }
+        });
+        self.snapshot_cache = Some((rows, columns, focused, Arc::clone(&snapshot)));
+        snapshot
     }
 
     fn item_count(&self) -> usize {
@@ -283,6 +295,7 @@ impl Navigator {
     }
 
     fn request_preview(&mut self) {
+        self.snapshot_cache = None;
         let Some(path) = self.selected_path() else {
             self.preview = Preview::Empty;
             return;
@@ -291,13 +304,11 @@ impl Navigator {
         let directory = self.cursor == 0 && self.has_parent()
             || self.selected_entry().is_some_and(FileEntry::is_directory);
         self.preview = Preview::Loading { path: path.clone() };
-        let _ = self
-            .command_tx
-            .send(PreviewCommand::Inspect(PreviewRequest {
-                generation: self.generation,
-                path,
-                directory,
-            }));
+        let _ = self.command_tx.send(PreviewRequest {
+            generation: self.generation,
+            path,
+            directory,
+        });
     }
 
     fn preview_lines(&self) -> Vec<String> {
@@ -318,15 +329,14 @@ impl Navigator {
     }
 }
 
-fn preview_worker(command_rx: Receiver<PreviewCommand>, result_tx: Sender<PreviewResult>) {
+fn preview_worker(command_rx: Receiver<PreviewRequest>, result_tx: Sender<PreviewResult>) {
     loop {
-        let Ok(command) = command_rx.recv() else {
+        let Ok(mut request) = command_rx.recv() else {
             return;
         };
-        let PreviewCommand::Inspect(mut request) = command;
         loop {
             match command_rx.try_recv() {
-                Ok(PreviewCommand::Inspect(next)) => request = next,
+                Ok(next) => request = next,
                 Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             }
@@ -408,7 +418,6 @@ mod tests {
             path: root.join(name),
             kind,
             size: 0,
-            hidden: false,
             readable: true,
             modified_ns: 0,
         }
@@ -431,6 +440,40 @@ mod tests {
             navigator.activate(),
             Some(NavigatorAction::EnterDirectory(root.join("docs")))
         );
+    }
+
+    #[test]
+    fn snapshot_cache_tracks_selection_preview_focus_size_and_directory() {
+        let root = PathBuf::from("/tmp/gibson-cache-test");
+        let mut navigator = Navigator::new(root.clone()).unwrap();
+        let (results, result_rx) = unbounded();
+        navigator.result_rx = result_rx;
+        navigator.update(root.clone(), vec![entry(&root, "a", FileKind::File, 1)]);
+        let first = navigator.snapshot(12, 50, true);
+        assert!(Arc::ptr_eq(&first, &navigator.snapshot(12, 50, true)));
+        navigator.move_selection(1);
+        let selected = navigator.snapshot(12, 50, true);
+        assert_ne!(first.listing_fingerprint, selected.listing_fingerprint);
+        results
+            .send(PreviewResult {
+                generation: navigator.generation,
+                path: root.join("a"),
+                result: Ok(vec!["SIZE 123 BYTES".into()]),
+            })
+            .unwrap();
+        navigator.poll();
+        let preview = navigator.snapshot(12, 50, true);
+        assert!(preview.metadata.contains("SIZE 123 BYTES"));
+        assert_eq!(preview.listing_fingerprint, selected.listing_fingerprint);
+        assert!(
+            !navigator
+                .snapshot(12, 50, false)
+                .listing
+                .contains("CONTROL")
+        );
+        assert!(!Arc::ptr_eq(&preview, &navigator.snapshot(20, 80, true)));
+        navigator.update(root.join("empty"), Vec::new());
+        assert!(!navigator.snapshot(12, 50, true).listing.contains("FILE a"));
     }
 
     #[test]

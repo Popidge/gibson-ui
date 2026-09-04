@@ -5,10 +5,6 @@ pub enum VisualState {
 }
 
 impl VisualState {
-    pub fn shows_storeys(self) -> bool {
-        self == Self::Settled
-    }
-
     pub fn shows_file_menu(self) -> bool {
         self == Self::Settled
     }

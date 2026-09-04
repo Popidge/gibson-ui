@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 const APPEAR_TIME: Duration = Duration::from_millis(620);
 const TOWER_SPACING: f32 = 5.4;
-const MAX_VISIBLE_STOREYS: usize = 72;
 const MAX_CONNECTIONS: usize = 96;
 pub const MAX_TOWER_LABELS: usize = 32;
 const FILE_EFFECT_TIME: Duration = Duration::from_millis(1_100);
@@ -575,7 +574,7 @@ impl Scene {
             .map_or(Vec3::ZERO, |tower| tower.position);
         objects.clear();
         if objects.capacity() < max_objects {
-            objects.reserve(max_objects - objects.capacity());
+            objects.reserve(max_objects);
         }
 
         for tower in self
@@ -631,10 +630,9 @@ impl Scene {
                     now,
                     palette,
                 );
-                if state.shows_storeys() {
-                    add_storey_slabs(objects, current, now, palette);
-                    add_file_effects(objects, current, &self.file_effects, now, palette);
-                }
+            }
+            if visual_style == VisualStyle::Classic && state == VisualState::Settled {
+                add_file_effects(objects, current, &self.file_effects, now, palette);
             }
             if state != VisualState::Settled {
                 for entry in current
@@ -662,7 +660,7 @@ impl Scene {
         if visual_style == VisualStyle::Classic {
             for path in &self.tower_order {
                 if objects.len() >= max_objects {
-                    continue;
+                    break;
                 }
                 let Some(tower) = self.towers.get(path).filter(|tower| {
                     !tower.current && self.tower_is_visible(tower, state, camera_eye, camera_focus)
@@ -706,7 +704,7 @@ impl Scene {
             .values()
             .filter(|tower| self.tower_is_visible(tower, state, camera_eye, camera_focus))
             .collect::<Vec<_>>();
-        label_towers.sort_by(|left, right| {
+        let compare = |left: &&Tower, right: &&Tower| {
             right
                 .current
                 .cmp(&left.current)
@@ -716,7 +714,12 @@ impl Scene {
                         .total_cmp(&right.position.distance_squared(camera_focus))
                 })
                 .then_with(|| left.id.cmp(&right.id))
-        });
+        };
+        if label_towers.len() > max_labels {
+            label_towers.select_nth_unstable_by(max_labels, compare);
+            label_towers.truncate(max_labels);
+        }
+        label_towers.sort_unstable_by(compare);
 
         for tower in label_towers {
             let current = tower.current;
@@ -734,9 +737,6 @@ impl Scene {
                 text: tower.label.clone(),
                 current,
             });
-            if labels.len() == max_labels {
-                break;
-            }
         }
 
         labels
@@ -1001,58 +1001,6 @@ fn add_tower_bands(
                 tower.position + Vec3::new(0.0, y, 0.0),
             ),
             color: scaled_render_color(palette.primary, 0.72 + shimmer * 0.24, 0.8),
-        });
-    }
-}
-
-fn add_storey_slabs(
-    objects: &mut Vec<RenderObject>,
-    tower: &Tower,
-    now: Instant,
-    palette: ScenePalette,
-) {
-    if tower.children.is_empty() {
-        return;
-    }
-    let height = tower_height(tower);
-    let width = tower_width(tower);
-    let selected_index = tower
-        .selected
-        .and_then(|id| tower.children.iter().position(|entry| entry.id == id))
-        .unwrap_or(0);
-    let half = MAX_VISIBLE_STOREYS / 2;
-    let start = selected_index
-        .saturating_sub(half)
-        .min(tower.children.len().saturating_sub(MAX_VISIBLE_STOREYS));
-    let end = (start + MAX_VISIBLE_STOREYS).min(tower.children.len());
-    for (index, entry) in tower.children.iter().enumerate().take(end).skip(start) {
-        let selected = tower.selected == Some(entry.id);
-        let y = storey_height(index, tower.children.len(), height);
-        let pulse = (now.duration_since(tower.born).as_secs_f32() * 5.0 + index as f32 * 0.21)
-            .sin()
-            .abs();
-        let color = if selected {
-            scaled_render_color(palette.accent, 1.0 + pulse * 0.22, 2.8)
-        } else if !entry.readable {
-            render_color(palette.danger, 1.9)
-        } else if entry.is_directory() {
-            render_color(palette.primary, 1.65)
-        } else if entry.hidden {
-            scaled_render_color(palette.subdued, 0.42, 0.55)
-        } else {
-            render_color(palette.subdued, 1.1)
-        };
-        objects.push(RenderObject {
-            model: Mat4::from_scale_rotation_translation(
-                Vec3::new(
-                    width * if selected { 1.34 } else { 1.18 },
-                    0.065,
-                    width * 1.18,
-                ),
-                Quat::IDENTITY,
-                tower.position + Vec3::new(0.0, y, 0.0),
-            ),
-            color,
         });
     }
 }
@@ -1586,6 +1534,30 @@ mod tests {
     }
 
     #[test]
+    fn label_budget_keeps_the_nearest_towers_in_distance_order() {
+        let root = PathBuf::from("/gibson-label-test");
+        let mut scene = Scene::new(root.clone());
+        for index in (1..100).rev() {
+            let path = root.join(format!("tower-{index:03}"));
+            scene.ensure_tower(path.clone(), Instant::now());
+            scene.towers.get_mut(&path).unwrap().position = Vec3::X * index as f32;
+        }
+        let labels = scene.tower_labels(
+            Vec3::NEG_Z,
+            VisualState::Transit,
+            Vec3::NEG_Z * 8.0,
+            Vec3::ZERO,
+            10,
+            VisualStyle::Classic,
+        );
+        assert_eq!(labels.len(), 10);
+        assert!(labels[0].current);
+        for (index, label) in labels.iter().enumerate().skip(1) {
+            assert_eq!(label.text, format!("TOWER-{index:03}"));
+        }
+    }
+
+    #[test]
     fn directory_symlinks_remain_file_entries() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("target")).unwrap();
@@ -1744,6 +1716,41 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect.kind, FileEffectKind::Create))
         );
+    }
+
+    #[test]
+    fn classic_settled_view_renders_and_expires_file_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut scene = Scene::new(root.clone());
+        fs::write(root.join("incoming"), b"data").unwrap();
+        let entries = scan_directory(&root).unwrap();
+        scene.update(
+            root,
+            entries.clone(),
+            &[FileMutation::Created(entries[0].clone())],
+        );
+        let context = SceneRenderContext {
+            now: Instant::now() + Duration::from_millis(500),
+            state: VisualState::Settled,
+            camera_eye: Vec3::new(0.0, 4.0, -8.0),
+            camera_focus: Vec3::ZERO,
+            max_objects: MAX_RENDER_OBJECTS,
+            lightning: LightningOptions::OFF,
+            visual_style: VisualStyle::Classic,
+            palette: ScenePalette::CLASSIC,
+        };
+        let mut active = Vec::new();
+        let mut expired = Vec::new();
+        scene.write_render_objects(context, &mut active);
+        scene.write_render_objects(
+            SceneRenderContext {
+                now: context.now + FILE_EFFECT_TIME,
+                ..context
+            },
+            &mut expired,
+        );
+        assert_eq!(active.len(), expired.len() + 2);
     }
 
     #[test]

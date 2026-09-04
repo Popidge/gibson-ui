@@ -30,7 +30,6 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub kind: FileKind,
     pub size: u64,
-    pub hidden: bool,
     pub readable: bool,
     pub modified_ns: i128,
 }
@@ -263,8 +262,6 @@ pub fn scan_directory(root: &Path) -> anyhow::Result<Vec<FileEntry>> {
             FileKind::Other
         };
         let name = item.file_name();
-        let raw_name = name.as_os_str().as_bytes();
-        let hidden = raw_name.first() == Some(&b'.');
         let modified_ns =
             i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
         entries.push(FileEntry {
@@ -274,7 +271,6 @@ pub fn scan_directory(root: &Path) -> anyhow::Result<Vec<FileEntry>> {
             path,
             kind,
             size: metadata.len(),
-            hidden,
             readable: mode & 0o400 != 0,
             modified_ns,
         });

@@ -245,8 +245,10 @@ impl Terminal {
             rows,
             columns: cols,
         });
-        drop(parser);
+        // Read the revision while the parser is locked: a later revision may describe
+        // output that is absent from this snapshot.
         let revision = self.revision.load(Ordering::Acquire);
+        drop(parser);
         if revision.is_multiple_of(2) {
             let mut cache = self
                 .snapshot_cache
