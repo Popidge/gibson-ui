@@ -4,6 +4,15 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-05
+
+- Reduced terminal reshaping, navigator snapshot work, and repeated text preparation.
+- Reduced film-mode scene-copy costs on supported graphics devices.
+- Paused inaudible music to avoid unnecessary decoding and mixing.
+- Added optional GPU pass timings to performance logging.
+- Fixed terminal snapshot consistency during concurrent output.
+- Fixed Unicode color parsing and restored classic file-change effects.
+- Removed dead rendering code and simplified hot paths.
 - Added a checksum-verified installer for the latest GitHub release.
 
 ## 0.3.0 - 2026-08-29
