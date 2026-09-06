@@ -33,8 +33,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     return output;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn background_color(input: VertexOutput) -> vec4<f32> {
     let mode = uniforms.options.x;
     if mode < 0.5 {
         return vec4<f32>(uniforms.deep_background.rgb, 1.0);
@@ -57,4 +56,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let theme_tint = vec3<f32>(0.72) + uniforms.background.rgb * 0.55;
     let tinted = mix(image, image * theme_tint, 0.16);
     return vec4<f32>(tinted * 0.58, 1.0);
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> { return background_color(input); }
+struct CinematicOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) emission: vec4<f32>,
+}
+@fragment
+fn fs_cinematic(input: VertexOutput) -> CinematicOutput {
+    var output: CinematicOutput;
+    output.color = background_color(input);
+    output.emission = vec4<f32>(0.0);
+    return output;
 }

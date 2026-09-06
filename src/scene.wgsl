@@ -1,15 +1,3 @@
-struct Uniforms {
-    view_proj: mat4x4<f32>,
-    camera_time: vec4<f32>,
-    pulse: vec4<f32>,
-    primary: vec4<f32>,
-    secondary: vec4<f32>,
-    accent: vec4<f32>,
-    background: vec4<f32>,
-    active_face: vec4<f32>,
-    render_size: vec4<f32>,
-}
-
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
@@ -24,6 +12,13 @@ var blurred_scene_texture: texture_2d<f32>;
 
 @group(2) @binding(1)
 var blurred_scene_sampler: sampler;
+
+@group(3) @binding(0)
+var reflection_texture: texture_2d<f32>;
+@group(3) @binding(1)
+var reflection_sampler: sampler;
+
+const FLOOR_HEIGHT: f32 = -0.41;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -42,10 +37,10 @@ struct VertexOutput {
     @location(2) color: vec4<f32>,
     @location(3) local_position: vec3<f32>,
     @location(4) local_normal: vec3<f32>,
+    @location(5) @interpolate(flat) center: vec3<f32>,
 }
 
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
+fn scene_vertex(input: VertexInput) -> VertexOutput {
     let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
     let world = model * vec4<f32>(input.position, 1.0);
     var output: VertexOutput;
@@ -55,6 +50,20 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.color = input.color;
     output.local_position = input.position;
     output.local_normal = input.normal;
+    output.center = model[3].xyz;
+    return output;
+}
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    return scene_vertex(input);
+}
+
+@vertex
+fn vs_reflection(input: VertexInput) -> VertexOutput {
+    var output = scene_vertex(input);
+    let reflected = vec3<f32>(output.world_position.x, 2.0 * FLOOR_HEIGHT - output.world_position.y, output.world_position.z);
+    output.clip_position = uniforms.view_proj * vec4<f32>(reflected, 1.0);
     return output;
 }
 
@@ -142,8 +151,7 @@ fn movie_circuit_floor(position: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(board + (cyan + magenta) * fade, 1.0);
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn surface_color(input: VertexOutput) -> vec4<f32> {
     if input.color.a < 0.1 {
         if uniforms.pulse.w > 0.5 {
             return movie_circuit_floor(input.world_position.xz);
@@ -284,4 +292,306 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let themed_emissive = mix(emissive, emissive * uniforms.primary.rgb * 1.65, 0.24);
     let final_color = mix(lit + themed_emissive, uniforms.background.rgb * 0.07, fog);
     return vec4<f32>(final_color, 1.0);
+}
+
+// Cinematic keeps light emission separate from scene colour. Text, wallpaper and
+// transmitted background never enter the bloom buffer.
+fn face_edge(input: VertexOutput) -> f32 {
+    let n = abs(input.local_normal);
+    var uv = input.local_position.xy;
+    if n.x > 0.5 { uv = input.local_position.zy; }
+    if n.y > 0.5 { uv = input.local_position.xz; }
+    return line_mask(0.5 - max(abs(uv.x), abs(uv.y)), 0.005);
+}
+
+fn is_navigator(input: VertexOutput) -> bool {
+    let current = select(abs(input.color.a - 1.55) < 0.01, abs(input.color.a - 0.22) < 0.01, uniforms.pulse.w > 0.5);
+    return current && uniforms.active_face.w > 0.5 && dot(input.world_normal, uniforms.active_face.xyz) > 0.98;
+}
+
+fn arrival_light() -> f32 {
+    let phase = uniforms.cinematic.y;
+    return select(0.0, sin(clamp(phase, 0.0, 1.0) * 3.141593), phase >= 0.0);
+}
+
+fn journey_floor(position: vec2<f32>) -> vec3<f32> {
+    let destination = uniforms.destination.xz;
+    let radius = distance(position, destination);
+    let phase = uniforms.cinematic.y;
+    let ring = exp(-pow((radius - (0.8 + max(phase, 0.0) * 10.0)) / 0.28, 2.0)) * arrival_light();
+    let base_pool = exp(-radius * radius / 9.0) * arrival_light() * 0.28;
+    // A short luminous wake follows the same Bezier as the camera, projected
+    // onto the floor. Sampling only the wake keeps the per-pixel work bounded.
+    let progress = smoothstep(0.0, 1.0, uniforms.cinematic.z);
+    var route_pulse = 0.0;
+    for (var i = 0; i < 10; i = i + 1) {
+        let t = clamp(progress + 0.055 - f32(i) * 0.018, 0.0, 1.0);
+        let u = 1.0 - t;
+        let point = u*u*u * uniforms.departure.xz
+            + 3.0*u*u*t * uniforms.route_controls.xy
+            + 3.0*u*t*t * uniforms.route_controls.zw + t*t*t * destination;
+        let delta = position - point;
+        route_pulse = max(route_pulse, exp(-dot(delta, delta) / 0.16) * (1.0 - f32(i) / 10.0));
+    }
+    route_pulse *= uniforms.pulse.y * uniforms.pulse.z;
+    return uniforms.primary.rgb * (base_pool + ring * 1.4 * uniforms.pulse.z + route_pulse * 1.8);
+}
+
+fn glass_tint(input: VertexOutput) -> vec3<f32> {
+    // Material variation must preserve the danger colour of unreadable towers.
+    if abs(input.color.a - 0.24) < 0.01 { return input.color.rgb; }
+    let seed = hash21(input.center.xz + vec2<f32>(19.0, 71.0));
+    let tint = mix(uniforms.primary.rgb, uniforms.secondary.rgb, seed * 0.24);
+    return tint * select(1.0, 0.72, abs(input.color.a - 0.14) < 0.01);
+}
+
+fn glass_detail(input: VertexOutput) -> vec3<f32> {
+    let n = abs(input.local_normal);
+    var uv = input.local_position.xy;
+    var view = normalize(uniforms.camera_time.xyz - input.world_position).xy;
+    if n.x > 0.5 {
+        uv = input.local_position.zy;
+        view = normalize(uniforms.camera_time.xyz - input.world_position).zy;
+    }
+    if n.y > 0.5 { uv = input.local_position.xz; }
+    let seed = hash21(input.center.xz + vec2<f32>(19.0, 71.0));
+    let etched = step(0.35, seed) * (1.0 - step(0.73, seed));
+    // Two etched planes suggest internal depth without extra scene objects.
+    let front = uv + view * 0.025;
+    let back = uv + view * 0.075;
+    let lane_a = line_mask(abs(fract(front.x * (4.0 + floor(seed * 6.0)) + 0.5) - 0.5), 0.012);
+    let lane_b = line_mask(abs(fract(back.y * 13.0 + 0.5) - 0.5), 0.015);
+    let border_fade = smoothstep(0.0, 0.10, 0.5 - max(abs(uv.x), abs(uv.y)));
+    let distance_fade = 1.0 - smoothstep(12.0, 36.0, distance(input.world_position, uniforms.camera_time.xyz));
+    let light = 0.7 + 0.3 * sin(input.world_position.y * 1.5 - uniforms.camera_time.w * 0.55 * uniforms.cinematic.w);
+    let core = line_mask(abs(back.x - (seed - 0.5) * 0.35), 0.009);
+    let slots = line_mask(abs(fract(back.y * 28.0) - 0.5), 0.06) * core;
+    let detail = (lane_a * 0.055 + lane_b * 0.035) * (0.55 + etched * 1.8) + core * 0.08 + slots * 0.18;
+    return glass_tint(input) * detail * border_fade * distance_fade * light;
+}
+
+fn lightning_illumination(position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var light = vec3<f32>(0.0);
+    for (var i = 0u; i < 4u; i += 1u) {
+        let source = uniforms.lightning_positions[i];
+        if source.w <= 0.001 { continue; }
+        let delta = source.xyz - position;
+        let distance_squared = dot(delta, delta);
+        let direction = delta / sqrt(max(distance_squared, 0.001));
+        // A broad local wash, including a little transmission through glass.
+        let facing = 0.25 + max(dot(normal, direction), 0.0) * 0.75;
+        light += uniforms.lightning_colors[i].rgb * source.w * facing / (1.0 + distance_squared * 0.16);
+    }
+    return light * 0.42;
+}
+
+fn floor_reflection(input: VertexOutput) -> vec3<f32> {
+    if uniforms.cinematic.x < 0.5 { return vec3<f32>(0.0); }
+    let uv = input.clip_position.xy * uniforms.render_size.zw;
+    let bounds = uniforms.visual_bounds;
+    // World-anchored, very shallow surface waviness: no swimming screen noise.
+    let position = input.world_position.xz;
+    let grain = sin(position.x * 1.7 + sin(position.y * 0.6)) * sin(position.y * 2.1);
+    let offset = vec2<f32>(grain * 0.7, sin(position.y * 3.2) * 0.35) * uniforms.render_size.zw;
+    let sample_uv = clamp(uv + offset, bounds.xy + uniforms.render_size.zw, bounds.xy + bounds.zw - uniforms.render_size.zw);
+    let reflection = textureSample(reflection_texture, reflection_sampler, sample_uv).rgb;
+    let direction = normalize(uniforms.camera_time.xyz - input.world_position);
+    let fresnel = 0.36 + 0.40 * pow(1.0 - max(direction.y, 0.0), 3.0);
+    let fade = 1.0 - smoothstep(22.0, 78.0, distance(input.world_position, uniforms.camera_time.xyz));
+    let roughness = 0.93 + grain * 0.07;
+    return reflection * fresnel * fade * roughness * uniforms.cinematic.x;
+}
+
+// The mirror pass deliberately contains materials only: no wallpaper, floor,
+// navigator, labels, or decorative geometry can reflect recursively.
+@fragment
+fn fs_reflection(input: VertexOutput) -> @location(0) vec4<f32> {
+    let edge = face_edge(input);
+    let seed = hash21(input.center.xz + vec2<f32>(19.0, 71.0));
+    let smoked = step(0.73, seed);
+    let tint = glass_tint(input);
+    let height_fade = exp(-max(input.world_position.y - FLOOR_HEIGHT, 0.0) * 0.075);
+    var material = tint * (0.10 + edge * 1.3) * (1.0 - smoked * 0.28);
+    if uniforms.pulse.w < 0.5 { material = input.color.rgb * (0.28 + edge * 0.75); }
+    let glow = lightning_illumination(input.world_position, input.world_normal);
+    return vec4<f32>((material + glow * 0.45) * height_fade, 1.0);
+}
+
+struct CinematicOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) emission: vec4<f32>,
+}
+
+// Light lives on the pane, so tower depth and glass compositing naturally
+// occlude it. Event groups share one bounded wave under sustained writes.
+fn filesystem_light(input: VertexOutput) -> vec3<f32> {
+    if uniforms.pulse.w < 0.5 || input.color.a < 0.1 || input.color.a >= 0.3 { return vec3<f32>(0.0); }
+    var light = vec3<f32>(0.0);
+    let navigator = is_navigator(input);
+    let horizontal = vec3<f32>(-uniforms.active_face.z, 0.0, uniforms.active_face.x);
+    let uv = vec2<f32>(0.5 - dot(input.local_position, horizontal), 0.5 - input.local_position.y);
+    // Two softly antialiased rails, confined to the clear outside margin.
+    let rail_distance = min(uv.x, 1.0 - uv.x);
+    let rail_width = max(fwidth(uv.x), 0.002);
+    let rails = 1.0 - smoothstep(0.007, 0.007 + rail_width, rail_distance);
+    for (var i = 0; i < 8; i = i + 1) {
+        let position = uniforms.activity_positions[i];
+        if position.w <= 0.0 { break; }
+        let tower_delta = input.center.xz - position.xz;
+        if dot(tower_delta, tower_delta) > 0.0025 { continue; }
+        let event = uniforms.activity_events[i];
+        let phase = clamp(position.y, 0.0, 1.0);
+        let envelope = sin(phase * 3.141593) * select(0.0, 1.0, position.y < 1.0);
+        let y = input.local_position.y;
+        var level = event.y;
+        var color = uniforms.secondary.rgb;
+        var shape = 0.0;
+        if event.z < 0.5 {
+            // Creation rises from the foot, then settles at the new file level.
+            level = mix(-0.5, event.y, smoothstep(0.0, 0.7, phase));
+            color = uniforms.primary.rgb;
+        } else if event.z < 1.5 {
+            level = event.x - phase * 0.16;
+            color = mix(uniforms.secondary.rgb, uniforms.accent.rgb, 0.45);
+        } else if event.z < 2.5 {
+            level = mix(event.x, event.y, smoothstep(0.0, 1.0, phase));
+            color = uniforms.accent.rgb;
+        } else {
+            // A save sends two small ripples away from its file level.
+            level = event.y;
+        }
+        let width = 0.012 + event.w * 0.008;
+        var delta = abs(y - level);
+        if event.z > 2.5 { delta = abs(delta - phase * 0.18); }
+        shape = exp(-pow(delta / width, 2.0));
+        let edge = face_edge(input);
+        let residual = position.w * (0.018 + edge * 0.09);
+        if navigator {
+            let travelling = exp(-pow((y - level) / 0.08, 2.0));
+            light += color * rails * (envelope * (0.16 + travelling * 0.95) + position.w * 0.035);
+        } else {
+            light += color * (shape * envelope * (0.30 + event.w * 0.10) + residual);
+        }
+    }
+    if navigator {
+        // A narrow dash sits before the text's left padding, at the actual
+        // visible row. Scrolling and the parent-directory row are accounted for.
+        let metrics = uniforms.navigator_metrics;
+        let marker_x = metrics.z * 0.55;
+        let marker_width = metrics.w * 3.0;
+        let x_mask = 1.0 - smoothstep(marker_width, marker_width + max(fwidth(uv.x), 0.001), abs(uv.x - marker_x));
+        for (var i = 0; i < 4; i = i + 1) {
+            let row = uniforms.activity_rows[i];
+            if row.w < 0.5 { continue; }
+            let center_y = metrics.x + (row.x + 0.5) * metrics.y;
+            let y_mask = 1.0 - smoothstep(metrics.y * 0.15, metrics.y * 0.25, abs(uv.y - center_y));
+            var color = uniforms.secondary.rgb;
+            if row.z < 0.5 { color = uniforms.primary.rgb; }
+            if row.z > 1.5 && row.z < 2.5 { color = uniforms.accent.rgb; }
+            light += color * x_mask * y_mask * sin(row.y * 3.141593) * 1.1;
+        }
+    }
+    return min(light, vec3<f32>(1.2));
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let base = surface_color(input);
+    return vec4<f32>(base.rgb + filesystem_light(input), base.a);
+}
+
+@fragment
+fn fs_cinematic(input: VertexOutput) -> CinematicOutput {
+    var base = vec4<f32>(0.0);
+    var glow = vec3<f32>(0.0);
+    let floor = input.color.a < 0.1;
+    let glass = uniforms.pulse.w > 0.5 && input.color.a >= 0.1 && input.color.a < 0.3;
+    let navigator = is_navigator(input);
+    // Cinematic glass replaces the ordinary glass material completely.
+    if !glass || navigator { base = surface_color(input); }
+    if floor {
+        // Keep moving floor light out of the glass transmission source. It is
+        // rendered later against solid tower depth, independently of glass opacity.
+        let radius = distance(input.world_position.xz, uniforms.destination.xz);
+        let base_pool = uniforms.primary.rgb * exp(-radius * radius / 9.0) * 0.12;
+        let reflected = floor_reflection(input);
+        let wash = lightning_illumination(input.world_position, vec3<f32>(0.0, 1.0, 0.0));
+        base = vec4<f32>(base.rgb * 0.78 + reflected + base_pool + wash, base.a);
+        glow = max(base.rgb - uniforms.background.rgb * 0.32 - vec3<f32>(0.22), vec3<f32>(0.0)) * 0.55 + base_pool * 0.65;
+    } else if !navigator {
+        let edge = face_edge(input);
+        let proximity = exp(-distance(input.world_position.xz, uniforms.destination.xz) * 0.8);
+        let destination_tower = exp(-distance(input.center.xz, uniforms.destination.xz) * 2.0);
+        let anticipation = sin(clamp(uniforms.cinematic.z / 0.3, 0.0, 1.0) * 3.141593)
+            * select(0.0, 1.0, uniforms.cinematic.w > 0.01);
+        let sweep_height = -0.5 + clamp(uniforms.cinematic.y * 1.25, 0.0, 1.0);
+        let sweep = exp(-pow((input.local_position.y - sweep_height) / 0.12, 2.0));
+        let arrival = arrival_light() * proximity * 0.3
+            + destination_tower * (anticipation * edge * 0.9 + sweep * arrival_light() * 1.2);
+        if glass {
+            let direction = normalize(uniforms.camera_time.xyz - input.world_position);
+            let fresnel = pow(1.0 - abs(dot(direction, input.world_normal)), 3.0);
+            let seed = hash21(input.center.xz + vec2<f32>(19.0, 71.0));
+            let smoked = step(0.73, seed);
+            let clear = 1.0 - step(0.35, seed);
+            let tint = glass_tint(input);
+            let n = abs(input.local_normal);
+            var plane = input.local_position.xy;
+            if n.x > 0.5 { plane = input.local_position.zy; }
+            if n.y > 0.5 { plane = input.local_position.xz; }
+            let bevel_width = 0.5 - max(abs(plane.x), abs(plane.y));
+            let shoulder = 1.0 - smoothstep(0.004, 0.045, bevel_width);
+            // A fixed studio light catches the bevel as the camera moves.
+            // No timer: a settled view stays quiet.
+            let half_vector = normalize(direction + normalize(vec3<f32>(-0.4, 0.8, 0.3)));
+            let glint = pow(max(dot(input.world_normal, half_vector), 0.0), 48.0)
+                * shoulder * (0.16 + seed * 0.12);
+            let bevel = tint * (edge * (0.70 + fresnel * 0.55) + shoulder * fresnel * 0.18)
+                + uniforms.accent.rgb * glint;
+            let detail = glass_detail(input);
+            // A restrained screen-space offset at grazing angles gives the pane thickness.
+            let offset = input.world_normal.xy * (1.0 + fresnel * 4.0 + shoulder * 2.0);
+            let transmission = blurred_scene(input.clip_position.xy + offset);
+            let body = transmission * (0.38 + clear * 0.16 - smoked * 0.18 + fresnel * 0.14) + tint * (0.065 + smoked * 0.025);
+            let inner = uniforms.primary.rgb * arrival * (0.32 + edge * 0.8);
+            let wash = lightning_illumination(input.world_position, input.world_normal);
+            base = vec4<f32>(body + bevel + detail + inner + wash, min(0.97, 0.82 - clear * 0.12 + smoked * 0.12 + edge * 0.10));
+            glow = bevel * 1.25 + detail * 0.35 + inner + wash * 0.35;
+        } else {
+            let seam = uniforms.primary.rgb * edge * 0.18;
+            let inner = uniforms.primary.rgb * arrival * 0.25 + lightning_illumination(input.world_position, input.world_normal);
+            base = vec4<f32>(base.rgb + seam + inner, base.a);
+            glow = max(base.rgb - vec3<f32>(0.65), vec3<f32>(0.0)) * 0.55 + seam + inner;
+        }
+    }
+    let activity = filesystem_light(input);
+    base = vec4<f32>(base.rgb + activity, base.a);
+    glow += activity * 0.8;
+    // Height fog gives distant towers separation while keeping the working face clear.
+    if !navigator {
+        let distance_to_eye = distance(input.world_position, uniforms.camera_time.xyz);
+        let low_haze = exp(-max(input.world_position.y + 0.42, 0.0) * 0.32);
+        let haze = (1.0 - exp(-distance_to_eye * 0.014)) * (0.20 + low_haze * 0.52);
+        let atmosphere = uniforms.background.rgb * 0.22 + uniforms.primary.rgb * 0.035;
+        base = vec4<f32>(mix(base.rgb, atmosphere, haze), base.a);
+        glow *= 1.0 - haze;
+    }
+    var output: CinematicOutput;
+    output.color = base;
+    output.emission = vec4<f32>(glow, base.a);
+    return output;
+}
+
+// Floor light is composited only after glass, with its own tower depth mask.
+// Neither the sharp ring nor its emission can leak through the transmission blur.
+@fragment
+fn fs_floor_journey(input: VertexOutput) -> CinematicOutput {
+    if input.world_normal.y < 0.5 { discard; }
+    let distance_to_eye = distance(input.world_position, uniforms.camera_time.xyz);
+    let fade = 1.0 - (1.0 - exp(-distance_to_eye * 0.014)) * 0.72;
+    let light = journey_floor(input.world_position.xz) * fade;
+    var output: CinematicOutput;
+    output.color = vec4<f32>(light, 0.0);
+    output.emission = vec4<f32>(light * 1.2, 0.0);
+    return output;
 }

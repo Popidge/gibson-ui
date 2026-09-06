@@ -21,6 +21,7 @@ pub enum NavigatorAction {
 #[derive(Clone, Debug)]
 pub struct NavigatorSnapshot {
     pub listing: String,
+    pub visible_file_ids: Vec<Option<u128>>,
     pub listing_fingerprint: u64,
     pub metadata: String,
     pub metadata_fingerprint: u64,
@@ -227,7 +228,16 @@ impl Navigator {
         listing.hash(&mut listing_hasher);
         let mut metadata_hasher = DefaultHasher::new();
         metadata.hash(&mut metadata_hasher);
+        let visible_file_ids = (start..end)
+            .map(|index| {
+                index
+                    .checked_sub(usize::from(self.has_parent()))
+                    .and_then(|index| self.entries.get(index))
+                    .map(|entry| entry.id)
+            })
+            .collect();
         let snapshot = Arc::new(NavigatorSnapshot {
+            visible_file_ids,
             listing,
             listing_fingerprint: listing_hasher.finish(),
             metadata,

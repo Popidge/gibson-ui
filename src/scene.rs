@@ -35,8 +35,16 @@ struct Tower {
     updated: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderKind {
+    Tower,
+    Decoration,
+    Lightning,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RenderObject {
+    pub kind: RenderKind,
     pub model: Mat4,
     pub color: [f32; 4],
 }
@@ -45,6 +53,7 @@ pub struct RenderObject {
 pub struct LightningOptions {
     pub load: f32,
     pub max_arcs: usize,
+    pub filaments: bool,
     pub segments: usize,
 }
 
@@ -86,6 +95,7 @@ impl LightningOptions {
     pub const OFF: Self = Self {
         load: 0.0,
         max_arcs: 0,
+        filaments: false,
         segments: 0,
     };
 }
@@ -145,12 +155,14 @@ struct FlightParameters {
     motion_scale: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+// These discriminants are also used by the activity shader.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u8)]
 enum FileEffectKind {
-    Create,
-    Remove,
-    Rename,
-    Modify,
+    Create = 0,
+    Remove = 1,
+    Rename = 2,
+    Modify = 3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +171,18 @@ struct FileEffect {
     started: Instant,
     from_index: usize,
     to_index: usize,
+}
+
+// Keep a short activity memory per tower, independent of navigation.
+struct GlassActivity {
+    file_id: u128,
+    root: PathBuf,
+    kind: FileEffectKind,
+    started: Instant,
+    last_seen: Instant,
+    from: f32,
+    to: f32,
+    count: u32,
 }
 
 impl CameraFlight {
@@ -274,6 +298,7 @@ pub struct Scene {
     visual_state: VisualState,
     motion_scale: f32,
     file_effects: Vec<FileEffect>,
+    glass_activity: Vec<GlassActivity>,
 }
 
 impl Scene {
@@ -291,6 +316,7 @@ impl Scene {
             visual_state: VisualState::Transit,
             motion_scale: 1.0,
             file_effects: Vec::new(),
+            glass_activity: Vec::new(),
         };
         scene.ensure_tower(root, now);
         scene
@@ -507,6 +533,34 @@ impl Scene {
             .clamp(0.0, 1.0)
     }
 
+    /// Flight phase continues briefly after landing; stationary/reduced-motion views
+    /// never replay an arrival. A new waypoint replaces this envelope immediately.
+    pub fn cinematic_journey(&self, now: Instant) -> (Vec3, Vec3, f32) {
+        let arrival = if self.flight.duration.is_zero() || self.motion_scale <= 0.01 {
+            -1.0
+        } else {
+            let elapsed = now
+                .saturating_duration_since(self.flight.started)
+                .as_secs_f32();
+            let phase = (elapsed - self.flight.duration.as_secs_f32() + 0.35) / 1.6;
+            if (0.0..1.0).contains(&phase) {
+                phase
+            } else {
+                -1.0
+            }
+        };
+        (self.flight.from, self.flight.to, arrival)
+    }
+
+    pub fn flight_controls(&self) -> [f32; 4] {
+        [
+            self.flight.control_a.x,
+            self.flight.control_a.z,
+            self.flight.control_b.x,
+            self.flight.control_b.z,
+        ]
+    }
+
     pub fn camera_direction(&self, now: Instant) -> Vec3 {
         let progress = smoothstep(self.flight_progress(now));
         self.flight
@@ -617,7 +671,11 @@ impl Scene {
                     0.14
                 };
             }
-            objects.push(RenderObject { model, color });
+            objects.push(RenderObject {
+                kind: RenderKind::Tower,
+                model,
+                color,
+            });
         }
 
         if let Some(current) = self.towers.get(current_path) {
@@ -753,7 +811,17 @@ impl Scene {
         };
         self.file_effects
             .retain(|effect| now.duration_since(effect.started) < FILE_EFFECT_TIME);
-        for mutation in mutations.iter().take(24) {
+        let mut sampled = [0_u8; 4];
+        for mutation in mutations.iter().filter(|mutation| {
+            let kind = match mutation {
+                FileMutation::Created(_) => 0,
+                FileMutation::Removed(_) => 1,
+                FileMutation::Renamed { .. } => 2,
+                FileMutation::Modified(_) => 3,
+            };
+            sampled[kind] = sampled[kind].saturating_add(1);
+            sampled[kind] <= 6
+        }) {
             let effect = match mutation {
                 FileMutation::Created(entry) => FileEffect {
                     kind: FileEffectKind::Create,
@@ -807,8 +875,126 @@ impl Scene {
                         .unwrap_or(0),
                 },
             };
+            let file_id = match mutation {
+                FileMutation::Created(entry)
+                | FileMutation::Removed(entry)
+                | FileMutation::Modified(entry) => entry.id,
+                FileMutation::Renamed { after, .. } => after.id,
+            };
+            let levels = next_entries.len().max(current.children.len()).max(1) as f32;
+            let from = 0.5 - (effect.from_index as f32 + 0.5) / levels;
+            let to = 0.5 - (effect.to_index as f32 + 0.5) / levels;
+            if let Some(activity) = self
+                .glass_activity
+                .iter_mut()
+                .find(|activity| activity.root == self.root && activity.kind == effect.kind)
+            {
+                // Do not restart a ripple on every write; continuous work completes
+                // each wave before starting the next one.
+                if now.duration_since(activity.started) >= FILE_EFFECT_TIME {
+                    activity.started = now;
+                    activity.count = 0;
+                    activity.file_id = file_id;
+                    activity.from = from;
+                    activity.to = to;
+                }
+                activity.last_seen = now;
+                activity.count = (activity.count + 1).min(32);
+            } else {
+                self.glass_activity.push(GlassActivity {
+                    file_id,
+                    root: self.root.clone(),
+                    kind: effect.kind,
+                    started: now,
+                    last_seen: now,
+                    from,
+                    to,
+                    count: 1,
+                });
+            }
             self.file_effects.push(effect);
         }
+        self.file_effects
+            .drain(..self.file_effects.len().saturating_sub(24));
+        self.glass_activity
+            .retain(|a| now.duration_since(a.last_seen) < Duration::from_secs(5));
+        self.glass_activity.sort_by_key(|a| a.last_seen);
+        self.glass_activity
+            .drain(..self.glass_activity.len().saturating_sub(16));
+    }
+
+    /// File identity, rather than tower height, locates a marker in a scrolled list.
+    /// Removed or offscreen entries have no marker; their edge pulse still plays.
+    pub fn glass_activity_rows(&self, now: Instant, visible_ids: &[Option<u128>]) -> [[f32; 4]; 4] {
+        let mut rows = [[0.0; 4]; 4];
+        if self.motion_scale <= 0.01 {
+            return rows;
+        }
+        for activity in self.glass_activity.iter().filter(|a| a.root == self.root) {
+            let age = now
+                .saturating_duration_since(activity.started)
+                .as_secs_f32();
+            if age >= 1.1 || activity.kind == FileEffectKind::Remove {
+                continue;
+            }
+            let Some(row) = visible_ids
+                .iter()
+                .position(|id| *id == Some(activity.file_id))
+            else {
+                continue;
+            };
+            let kind = activity.kind as usize;
+            rows[kind] = [row as f32 + 2.0, age / 1.1, kind as f32, 1.0];
+        }
+        rows
+    }
+
+    /// Eight recent event groups, each with a tower position and shader envelope.
+    pub fn glass_activity_uniforms(&self, now: Instant) -> ([[f32; 4]; 8], [[f32; 4]; 8]) {
+        let mut positions = [[0.0; 4]; 8];
+        let mut events = [[0.0; 4]; 8];
+        if self.motion_scale <= 0.01 {
+            return (positions, events);
+        }
+        // queue_file_effects keeps this bounded history ordered by last_seen.
+        let mut slot = 0;
+        for activity in self
+            .glass_activity
+            .iter()
+            .rev()
+            .filter(|a| now.saturating_duration_since(a.last_seen) < Duration::from_secs(5))
+        {
+            let Some(tower) = self.towers.get(&activity.root) else {
+                continue;
+            };
+            let age = now
+                .saturating_duration_since(activity.started)
+                .as_secs_f32();
+            let residual = (1.0
+                - now
+                    .saturating_duration_since(activity.last_seen)
+                    .as_secs_f32()
+                    / 5.0)
+                .max(0.0);
+            positions[slot] = [
+                tower.position.x,
+                age / 1.1,
+                tower.position.z,
+                residual * residual,
+            ];
+            let kind = activity.kind as u8 as f32;
+            events[slot] = [
+                activity.from,
+                activity.to,
+                kind,
+                (activity.count as f32).sqrt().min(3.0),
+            ];
+            slot += 1;
+            if slot == 8 {
+                break;
+            }
+        }
+        (positions, events)
     }
 
     fn tower_is_visible(
@@ -995,6 +1181,7 @@ fn add_tower_bands(
             .sin()
             .abs();
         objects.push(RenderObject {
+            kind: RenderKind::Decoration,
             model: Mat4::from_scale_rotation_translation(
                 Vec3::new(width * 1.035, 0.025, width * 1.035),
                 Quat::IDENTITY,
@@ -1035,6 +1222,7 @@ fn add_file_effects(
                 let rise = smoothstep(progress.min(0.72) / 0.72);
                 let beam_height = (to_y + 0.35) * rise;
                 objects.push(RenderObject {
+                    kind: RenderKind::Decoration,
                     model: Mat4::from_scale_rotation_translation(
                         Vec3::new(width * 0.09, beam_height.max(0.03), width * 0.09),
                         Quat::from_rotation_y(progress * 2.4),
@@ -1043,6 +1231,7 @@ fn add_file_effects(
                     color: scaled_render_color(palette.primary, 1.2, 2.8 * envelope),
                 });
                 objects.push(RenderObject {
+                    kind: RenderKind::Decoration,
                     model: Mat4::from_scale_rotation_translation(
                         Vec3::new(width * (1.28 + envelope * 0.30), 0.055, width * 1.28),
                         Quat::from_rotation_y(progress * 0.32),
@@ -1054,6 +1243,7 @@ fn add_file_effects(
             FileEffectKind::Remove => {
                 let collapse = 1.0 - smoothstep(progress);
                 objects.push(RenderObject {
+                    kind: RenderKind::Decoration,
                     model: Mat4::from_scale_rotation_translation(
                         Vec3::new(
                             width * (1.25 + progress * 0.55),
@@ -1070,6 +1260,7 @@ fn add_file_effects(
                 let y = from_y + (to_y - from_y) * smoothstep(progress);
                 let vertical_span = (to_y - from_y).abs().max(0.2);
                 objects.push(RenderObject {
+                    kind: RenderKind::Decoration,
                     model: Mat4::from_scale_rotation_translation(
                         Vec3::new(width * 0.055, vertical_span, width * 0.055),
                         Quat::IDENTITY,
@@ -1078,6 +1269,7 @@ fn add_file_effects(
                     color: scaled_render_color(palette.secondary, 1.2, 2.1 * envelope),
                 });
                 objects.push(RenderObject {
+                    kind: RenderKind::Decoration,
                     model: Mat4::from_scale_rotation_translation(
                         Vec3::splat(0.16 + envelope * 0.16),
                         Quat::from_rotation_y(progress * 4.0),
@@ -1090,6 +1282,7 @@ fn add_file_effects(
                 let phase = progress * std::f32::consts::TAU * 2.0;
                 for offset in [0.0, std::f32::consts::PI] {
                     objects.push(RenderObject {
+                        kind: RenderKind::Decoration,
                         model: Mat4::from_scale_rotation_translation(
                             Vec3::splat(0.11 + envelope * 0.08),
                             Quat::from_rotation_y(phase + offset),
@@ -1146,6 +1339,7 @@ fn add_connection(
     let angle = -flat.z.atan2(flat.x);
     let rotation = Quat::from_rotation_y(angle);
     objects.push(RenderObject {
+        kind: RenderKind::Decoration,
         model: Mat4::from_scale_rotation_translation(
             Vec3::new(length, 0.025, if selected { 0.09 } else { 0.045 }),
             rotation,
@@ -1161,6 +1355,7 @@ fn add_connection(
     if selected {
         let phase = (elapsed * 0.7).fract();
         objects.push(RenderObject {
+            kind: RenderKind::Decoration,
             model: Mat4::from_scale_rotation_translation(
                 Vec3::splat(0.18),
                 Quat::IDENTITY,
@@ -1206,7 +1401,7 @@ fn add_tower_lightning(
     } else {
         mix_rgb(palette.accent, palette.secondary, 0.45)
     };
-    let thickness = 0.032 + load * 0.038;
+    let thickness = (0.032 + load * 0.038) * if options.filaments { 0.72 } else { 1.0 };
     let mut previous = surface + tangent * center_offset + Vec3::Y * start_y;
 
     for index in 1..=segments {
@@ -1236,7 +1431,10 @@ fn add_tower_lightning(
             ],
         );
 
-        if load > 0.42 && index % 3 == (seed as usize % 3) && objects.len() < max_objects {
+        if (load > 0.42 || options.filaments)
+            && index % 3 == (seed as usize % 3)
+            && objects.len() < max_objects
+        {
             let fork_seed = mix_seed(point_seed ^ 0xd1b5_4a35);
             let side = if fork_seed & 1 == 0 { -1.0 } else { 1.0 };
             let vertical = if rising { 1.0 } else { -1.0 };
@@ -1254,6 +1452,17 @@ fn add_tower_lightning(
                 thickness * 0.62,
                 [color[0], color[1], color[2], envelope * (5.2 + load * 3.0)],
             );
+            if options.filaments && objects.len() < max_objects {
+                let tip =
+                    fork + tangent * side * width * 0.13 + Vec3::Y * vertical * height * 0.065;
+                add_lightning_segment(
+                    objects,
+                    fork,
+                    tip,
+                    thickness * 0.28,
+                    [color[0], color[1], color[2], envelope * 4.5],
+                );
+            }
         }
         previous = point;
     }
@@ -1286,6 +1495,7 @@ fn add_lightning_segment(
         return;
     }
     objects.push(RenderObject {
+        kind: RenderKind::Lightning,
         model: Mat4::from_scale_rotation_translation(
             Vec3::new(thickness, length, thickness),
             Quat::from_rotation_arc(Vec3::Y, delta / length),
@@ -1492,6 +1702,84 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn cinematic_filaments_add_fine_branches_within_the_object_budget() {
+        let scene = Scene::new(PathBuf::from("/city"));
+        let tower = &scene.towers[&scene.root];
+        let render = |filaments, budget| {
+            let mut objects = Vec::new();
+            add_tower_lightning(
+                &mut objects,
+                tower,
+                Vec3::new(10.0, 4.0, 0.0),
+                LightningOptions {
+                    load: 0.2,
+                    max_arcs: 5,
+                    segments: 11,
+                    filaments,
+                },
+                LightningAnimation {
+                    travel: 0.5,
+                    envelope: 1.0,
+                    seed: 42,
+                },
+                budget,
+                ScenePalette::CLASSIC,
+            );
+            objects
+        };
+        let plain = render(false, 100);
+        let cinematic = render(true, 100);
+        assert!(cinematic.len() > plain.len());
+        assert!(
+            cinematic
+                .iter()
+                .all(|o| o.kind == RenderKind::Lightning && o.model.is_finite())
+        );
+        assert!(
+            cinematic
+                .iter()
+                .any(|o| o.model.x_axis.length() < plain[0].model.x_axis.length() * 0.4)
+        );
+        assert_eq!(render(true, 7).len(), 7);
+    }
+
+    #[test]
+    fn cinematic_arrival_expires_and_is_replaced_by_the_next_journey() {
+        let mut scene = Scene::new(PathBuf::from("/city"));
+        assert_eq!(scene.cinematic_journey(Instant::now()).2, -1.0);
+        scene.begin_waypoint(PathBuf::from("/city/first"), &[]);
+        let landing = scene.flight.started + scene.flight.duration;
+        let (from, to, phase) = scene.cinematic_journey(landing);
+        assert_eq!(from, scene.flight.from);
+        assert_eq!(to, scene.flight.to);
+        assert!((0.0..1.0).contains(&phase));
+        assert_eq!(
+            scene.cinematic_journey(landing + Duration::from_secs(2)).2,
+            -1.0
+        );
+        scene.begin_waypoint(PathBuf::from("/city/second"), &[]);
+        assert_eq!(
+            scene.cinematic_journey(scene.flight.started).1,
+            scene.flight.to
+        );
+        assert_eq!(scene.cinematic_journey(scene.flight.started).2, -1.0);
+    }
+
+    #[test]
+    fn cinematic_arrival_respects_zero_motion() {
+        let mut scene = Scene::new(PathBuf::from("/city"));
+        scene.set_motion_scale(0.0);
+        scene.begin_waypoint(PathBuf::from("/city/child"), &[]);
+        assert_eq!(scene.cinematic_journey(Instant::now()).2, -1.0);
+        assert_eq!(
+            scene
+                .cinematic_journey(Instant::now() + Duration::from_secs(1))
+                .2,
+            -1.0
+        );
+    }
+
+    #[test]
     fn files_are_storeys_and_directories_become_towers() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("directory")).unwrap();
@@ -1665,6 +1953,7 @@ mod tests {
             tower,
             Vec3::new(10.0, 4.0, 0.0),
             LightningOptions {
+                filaments: false,
                 load: 0.8,
                 max_arcs: 3,
                 segments: 9,
@@ -1716,6 +2005,104 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect.kind, FileEffectKind::Create))
         );
+    }
+
+    #[test]
+    fn glass_activity_coalesces_bursts_without_restarting_and_expires() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"data").unwrap();
+        let root = temp.path().to_path_buf();
+        let entries = scan_directory(&root).unwrap();
+        let mut scene = Scene::new(root.clone());
+        scene.update(root.clone(), entries.clone(), &[]);
+        let now = Instant::now();
+        let changes = vec![FileMutation::Modified(entries[0].clone()); 1000];
+        scene.queue_file_effects(&changes, &entries, now);
+        scene.queue_file_effects(&changes, &entries, now + Duration::from_millis(100));
+        assert_eq!(scene.glass_activity.len(), 1);
+        assert_eq!(scene.glass_activity[0].started, now);
+        assert!(scene.file_effects.len() <= 24);
+        let (positions, events) = scene.glass_activity_uniforms(now + Duration::from_millis(500));
+        assert!(positions[0][3] > 0.0);
+        assert_eq!(events[0][2], 3.0);
+        assert!(events[0][3] <= 3.0);
+        assert!(positions[1..].iter().all(|p| p[3] == 0.0));
+        // Leaving the directory must preserve its recent activity memory.
+        scene.update(root.join("elsewhere"), vec![], &[]);
+        assert!(
+            scene
+                .glass_activity_uniforms(now + Duration::from_secs(2))
+                .0[0][3]
+                > 0.0
+        );
+        assert!(
+            scene
+                .glass_activity_uniforms(now + Duration::from_secs(6))
+                .0
+                .iter()
+                .all(|p| p[3] == 0.0)
+        );
+        scene.motion_scale = 0.0;
+        assert!(
+            scene
+                .glass_activity_uniforms(now)
+                .0
+                .iter()
+                .all(|p| p[3] == 0.0)
+        );
+    }
+
+    #[test]
+    fn glass_activity_markers_follow_visible_identity_and_expire() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"data").unwrap();
+        let root = temp.path().to_path_buf();
+        let entries = scan_directory(&root).unwrap();
+        let id = entries[0].id;
+        let mut scene = Scene::new(root.clone());
+        scene.update(root, entries.clone(), &[]);
+        let now = Instant::now();
+        scene.queue_file_effects(&[FileMutation::Modified(entries[0].clone())], &entries, now);
+        let sample = now + Duration::from_millis(400);
+        // Header lines and the visible parent row precede the file.
+        assert_eq!(
+            scene.glass_activity_rows(sample, &[None, Some(id)])[3][0],
+            3.0
+        );
+        // A scrolled window moves the same file's marker to its new row.
+        assert_eq!(scene.glass_activity_rows(sample, &[Some(id)])[3][0], 2.0);
+        assert_eq!(scene.glass_activity_rows(sample, &[None]), [[0.0; 4]; 4]);
+        assert_eq!(
+            scene.glass_activity_rows(now + Duration::from_secs(2), &[Some(id)]),
+            [[0.0; 4]; 4]
+        );
+        scene.motion_scale = 0.0;
+        assert_eq!(
+            scene.glass_activity_rows(sample, &[Some(id)]),
+            [[0.0; 4]; 4]
+        );
+    }
+
+    #[test]
+    fn glass_activity_keeps_each_event_kind_in_large_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"data").unwrap();
+        let root = temp.path().to_path_buf();
+        let entries = scan_directory(&root).unwrap();
+        let entry = entries[0].clone();
+        let mut scene = Scene::new(root.clone());
+        scene.update(root, entries.clone(), &[]);
+        let mut changes = vec![FileMutation::Modified(entry.clone()); 1000];
+        changes.extend([
+            FileMutation::Created(entry.clone()),
+            FileMutation::Removed(entry.clone()),
+            FileMutation::Renamed {
+                before: entry.clone(),
+                after: entry,
+            },
+        ]);
+        scene.queue_file_effects(&changes, &entries, Instant::now());
+        assert_eq!(scene.glass_activity.len(), 4);
     }
 
     #[test]

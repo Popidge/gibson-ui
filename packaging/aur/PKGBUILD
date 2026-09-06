@@ -1,7 +1,7 @@
 # Maintainer: Jamie Taylor <j.taylor.1990 at gmail dot com>
 
 pkgname=gibson-ui-bin
-pkgver=0.3.1
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Cinematic 3D file-system visualiser for Omarchy and Wayland'
 arch=('x86_64')
@@ -17,7 +17,7 @@ provides=("gibson-ui=$pkgver")
 conflicts=('gibson-ui')
 options=('!debug')
 source_x86_64=("gibson-ui-$pkgver-x86_64.tar.zst::$url/releases/download/v$pkgver/gibson-ui-$pkgver-x86_64.tar.zst")
-sha256sums_x86_64=('de6587ba1f974570aa22a330bbb3e4d494fe0dd2eb09e539a59727288fc5525e')
+sha256sums_x86_64=('0f1516bf11fdb957443b61e8f3e0ca4557ef013ca8034d67cddb64f2b5aabfe6')
 
 package() {
   local release_dir="$srcdir/gibson-ui-$pkgver-$CARCH"

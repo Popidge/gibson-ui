@@ -1,10 +1,12 @@
-use crate::config::{FrameRate, Settings, SettingsSnapshot, ThemeBackdrop, VisualStyle};
+use crate::config::{
+    FrameRate, GraphicsQuality, Settings, SettingsSnapshot, ThemeBackdrop, VisualStyle,
+};
 use crate::layout::{CockpitLayout, LayoutPreferences, PaneTarget, Rect, Splitter};
 use crate::navigation::VisualState;
 use crate::navigator::NavigatorSnapshot;
 use crate::scene::{
-    CameraSubject, FacePanel, LightningOptions, MAX_RENDER_OBJECTS, MAX_TOWER_LABELS, RenderObject,
-    Scene, ScenePalette, SceneRenderContext, TowerLabel,
+    CameraSubject, FacePanel, LightningOptions, MAX_RENDER_OBJECTS, MAX_TOWER_LABELS, RenderKind,
+    RenderObject, Scene, ScenePalette, SceneRenderContext, TowerLabel,
 };
 use crate::system_load::SystemLoad;
 use crate::terminal::{TerminalColor, TerminalSnapshot, TerminalSpan};
@@ -38,6 +40,22 @@ const TERMINAL_BOTTOM_PADDING: f32 = 10.0;
 const MAX_UI_RECTS: usize = 2_048;
 const MICHROMA_FAMILY: &str = "Michroma";
 const FACE_SWEEP_RADIANS: f32 = std::f32::consts::FRAC_PI_4;
+const SCENE_SHADER: &str = concat!(
+    include_str!("uniforms.wgsl"),
+    "\n",
+    include_str!("scene.wgsl")
+);
+const BLOOM_SHADER: &str = concat!(
+    include_str!("uniforms.wgsl"),
+    "\n",
+    include_str!("bloom.wgsl")
+);
+const TOWER_LABEL_SHADER: &str = concat!(
+    include_str!("uniforms.wgsl"),
+    "\n",
+    include_str!("tower_label.wgsl")
+);
+
 const NAVIGATOR_TEXTURE_WIDTH: u32 = 768;
 const NAVIGATOR_TEXTURE_HEIGHT: u32 = 1_536;
 const NAVIGATOR_TEXTURE_SCALE: f32 = 2.0;
@@ -142,6 +160,17 @@ struct Uniforms {
     background: [f32; 4],
     active_face: [f32; 4],
     render_size: [f32; 4],
+    cinematic: [f32; 4],
+    destination: [f32; 4],
+    departure: [f32; 4],
+    route_controls: [f32; 4],
+    visual_bounds: [f32; 4],
+    lightning_positions: [[f32; 4]; 4],
+    lightning_colors: [[f32; 4]; 4],
+    activity_positions: [[f32; 4]; 8],
+    activity_events: [[f32; 4]; 8],
+    activity_rows: [[f32; 4]; 4],
+    navigator_metrics: [f32; 4],
 }
 
 #[repr(C)]
@@ -346,9 +375,70 @@ impl PerformanceStats {
     }
 }
 
+#[derive(Default)]
+struct LightningGlow {
+    positions: [[f32; 4]; 4],
+    colors: [[f32; 4]; 4],
+    updated: Option<Instant>,
+}
+
+impl LightningGlow {
+    fn update(&mut self, objects: &[RenderObject], now: Instant, enabled: bool) {
+        if !enabled {
+            *self = Self::default();
+            return;
+        }
+        let dt = self.updated.map_or(0.0, |previous| {
+            now.saturating_duration_since(previous).as_secs_f32()
+        });
+        self.updated = Some(now);
+        for position in &mut self.positions {
+            position[3] *= (-dt * 10.0).exp();
+        }
+        for object in objects
+            .iter()
+            .filter(|object| object.kind == RenderKind::Lightning)
+        {
+            let point = object.model.w_axis.truncate();
+            let strength = (object.color[3] * 0.11).clamp(0.0, 1.5);
+            let nearby = self.positions.iter().position(|p| {
+                p[3] > 0.01 && Vec3::new(p[0] - point.x, 0.0, p[2] - point.z).length_squared() < 2.0
+            });
+            let index = nearby.unwrap_or_else(|| {
+                self.positions
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a[3].total_cmp(&b[3]))
+                    .unwrap()
+                    .0
+            });
+            if strength >= self.positions[index][3] {
+                self.positions[index] = [point.x, point.y, point.z, strength];
+                self.colors[index] = object.color;
+            }
+        }
+    }
+}
+
 struct SceneTargets {
+    journey_depth: wgpu::TextureView,
+    reflection_view: wgpu::TextureView,
+    reflection_group: wgpu::BindGroup,
+    reflection_a_view: wgpu::TextureView,
+    reflection_a_group: wgpu::BindGroup,
+    reflection_b_view: wgpu::TextureView,
+    reflection_b_group: wgpu::BindGroup,
+    reflection_depth: wgpu::TextureView,
     color_view: wgpu::TextureView,
     color_group: wgpu::BindGroup,
+    composite_view: wgpu::TextureView,
+    composite_group: wgpu::BindGroup,
+    glow_view: wgpu::TextureView,
+    glow_group: wgpu::BindGroup,
+    bloom_a_view: wgpu::TextureView,
+    bloom_a_group: wgpu::BindGroup,
+    bloom_b_view: wgpu::TextureView,
+    bloom_b_group: wgpu::BindGroup,
     blur_a_view: wgpu::TextureView,
     blur_a_group: wgpu::BindGroup,
     blur_b_view: wgpu::TextureView,
@@ -364,17 +454,31 @@ pub struct Renderer {
     present_modes: Vec<wgpu::PresentMode>,
     pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
+    cinematic_pipeline: wgpu::RenderPipeline,
+    reflection_pipeline: wgpu::RenderPipeline,
+    journey_depth_pipeline: wgpu::RenderPipeline,
+    floor_journey_pipeline: wgpu::RenderPipeline,
+    reflection_horizontal_pipeline: wgpu::RenderPipeline,
+    reflection_vertical_pipeline: wgpu::RenderPipeline,
+    cinematic_glass_pipeline: wgpu::RenderPipeline,
+    bloom_horizontal_pipeline: wgpu::RenderPipeline,
+    bloom_vertical_pipeline: wgpu::RenderPipeline,
+    bloom_composite_pipeline: wgpu::RenderPipeline,
     tower_label_pipeline: wgpu::RenderPipeline,
     scene_copy_pipeline: wgpu::RenderPipeline,
     blur_horizontal_pipeline: wgpu::RenderPipeline,
     blur_vertical_pipeline: wgpu::RenderPipeline,
     background_pipeline: wgpu::RenderPipeline,
+    cinematic_background_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     ui_rect_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
     instance_buffer: wgpu::Buffer,
+    tower_body_instance_buffer: wgpu::Buffer,
+    tower_body_instances: Vec<InstanceRaw>,
+    lightning_glow: LightningGlow,
     tower_label_instance_buffer: wgpu::Buffer,
     render_objects: Vec<RenderObject>,
     glass_objects: Vec<RenderObject>,
@@ -600,12 +704,15 @@ impl Renderer {
             format,
             config.width,
             config.height,
+            settings.graphics.quality == GraphicsQuality::Cinematic,
+            settings.graphics.floor_reflections,
         );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
             bind_group_layouts: &[
                 Some(&uniform_layout),
                 Some(&navigator_texture_layout),
+                Some(&postprocess_texture_layout),
                 Some(&postprocess_texture_layout),
             ],
             immediate_size: 0,
@@ -618,31 +725,35 @@ impl Renderer {
             });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("scene.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(SCENE_SHADER.into()),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene pipeline"),
-            layout: Some(&pipeline_layout),
+        let reflection_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("reflection layout"),
+            bind_group_layouts: &[Some(&uniform_layout)],
+            immediate_size: 0,
+        });
+        let reflection_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mirrored tower pipeline"),
+            layout: Some(&reflection_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                entry_point: Some("vs_reflection"),
+                compilation_options: Default::default(),
                 buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                entry_point: Some("fs_reflection"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
+            // Mirroring Y reverses the winding of every face.
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: Some(wgpu::Face::Front),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -652,13 +763,70 @@ impl Renderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: Default::default(),
             multiview_mask: None,
             cache: None,
         });
+        let (journey_depth_pipeline, floor_journey_pipeline) =
+            create_floor_journey_pipelines(&device, &shader, &uniform_layout, format);
+        let create_pipeline = |cinematic: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("scene pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(if cinematic { "fs_cinematic" } else { "fs_main" }),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &if cinematic {
+                        vec![
+                            Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ]
+                    } else {
+                        vec![Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })]
+                    },
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = create_pipeline(false);
+        let cinematic_pipeline = create_pipeline(true);
         let tower_label_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tower label shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("tower_label.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(TOWER_LABEL_SHADER.into()),
         });
         let tower_label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tower label pipeline"),
@@ -697,42 +865,61 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let glass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glass tower pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let create_glass_pipeline = |cinematic: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("glass tower pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(if cinematic { "fs_cinematic" } else { "fs_main" }),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &if cinematic {
+                        vec![
+                            Some(wgpu::ColorTargetState {
+                                format,
+                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ]
+                    } else {
+                        vec![Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })]
+                    },
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let glass_pipeline = create_glass_pipeline(false);
+        let cinematic_glass_pipeline = create_glass_pipeline(true);
         let postprocess_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene blur shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
@@ -742,7 +929,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&postprocess_texture_layout)],
             immediate_size: 0,
         });
-        let create_postprocess_pipeline = |label, entry_point| {
+        let create_postprocess_pipeline = |label, entry_point, format| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&postprocess_layout),
@@ -769,11 +956,78 @@ impl Renderer {
                 cache: None,
             })
         };
-        let scene_copy_pipeline = create_postprocess_pipeline("scene copy pipeline", "fs_copy");
+        let scene_copy_pipeline =
+            create_postprocess_pipeline("scene copy pipeline", "fs_copy", format);
         let blur_horizontal_pipeline =
-            create_postprocess_pipeline("horizontal glass blur pipeline", "fs_horizontal");
+            create_postprocess_pipeline("horizontal glass blur pipeline", "fs_horizontal", format);
         let blur_vertical_pipeline =
-            create_postprocess_pipeline("vertical glass blur pipeline", "fs_vertical");
+            create_postprocess_pipeline("vertical glass blur pipeline", "fs_vertical", format);
+
+        let reflection_horizontal_pipeline = create_postprocess_pipeline(
+            "reflection blur horizontal",
+            "fs_reflection_horizontal",
+            format,
+        );
+        let reflection_vertical_pipeline = create_postprocess_pipeline(
+            "reflection blur vertical",
+            "fs_reflection_vertical",
+            format,
+        );
+        let bloom_horizontal_pipeline = create_postprocess_pipeline(
+            "bloom horizontal",
+            "fs_bloom_horizontal",
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let bloom_vertical_pipeline = create_postprocess_pipeline(
+            "bloom vertical",
+            "fs_bloom_vertical",
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cinematic bloom composite"),
+            source: wgpu::ShaderSource::Wgsl(BLOOM_SHADER.into()),
+        });
+        let bloom_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bloom composite layout"),
+            bind_group_layouts: &[
+                Some(&postprocess_texture_layout),
+                Some(&postprocess_texture_layout),
+                Some(&uniform_layout),
+            ],
+            immediate_size: 0,
+        });
+        let bloom_composite_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("bloom composite pipeline"),
+                layout: Some(&bloom_layout),
+                vertex: wgpu::VertexState {
+                    module: &bloom_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bloom_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("theme background shader"),
@@ -822,37 +1076,56 @@ impl Renderer {
             bind_group_layouts: &[Some(&background_texture_layout)],
             immediate_size: 0,
         });
-        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("theme background pipeline"),
-            layout: Some(&background_layout),
-            vertex: wgpu::VertexState {
-                module: &background_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &background_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let create_background_pipeline = |cinematic: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("theme background pipeline"),
+                layout: Some(&background_layout),
+                vertex: wgpu::VertexState {
+                    module: &background_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &background_shader,
+                    entry_point: Some(if cinematic { "fs_cinematic" } else { "fs_main" }),
+                    compilation_options: Default::default(),
+                    targets: &if cinematic {
+                        vec![
+                            Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ]
+                    } else {
+                        vec![Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })]
+                    },
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let background_pipeline = create_background_pipeline(false);
+        let cinematic_background_pipeline = create_background_pipeline(true);
         let wallpaper = (settings.appearance.backdrop == ThemeBackdrop::Wallpaper)
             .then_some(theme.wallpaper.as_deref())
             .flatten();
@@ -977,6 +1250,12 @@ impl Renderer {
             label: Some("cube indices"),
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
+        });
+        let tower_body_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tower body instances"),
+            size: (MAX_RENDER_OBJECTS * mem::size_of::<InstanceRaw>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene instances"),
@@ -1105,17 +1384,31 @@ impl Renderer {
             present_modes: capabilities.present_modes,
             pipeline,
             glass_pipeline,
+            cinematic_pipeline,
+            reflection_pipeline,
+            journey_depth_pipeline,
+            floor_journey_pipeline,
+            reflection_horizontal_pipeline,
+            reflection_vertical_pipeline,
+            cinematic_glass_pipeline,
+            bloom_horizontal_pipeline,
+            bloom_vertical_pipeline,
+            bloom_composite_pipeline,
             tower_label_pipeline,
             scene_copy_pipeline,
             blur_horizontal_pipeline,
             blur_vertical_pipeline,
             background_pipeline,
+            cinematic_background_pipeline,
             overlay_pipeline,
             ui_rect_pipeline,
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
             instance_buffer,
+            tower_body_instance_buffer,
+            tower_body_instances: Vec::with_capacity(128),
+            lightning_glow: LightningGlow::default(),
             tower_label_instance_buffer,
             render_objects: Vec::with_capacity(MAX_RENDER_OBJECTS),
             glass_objects: Vec::with_capacity(128),
@@ -1214,6 +1507,20 @@ impl Renderer {
         }
         self.performance
             .set_enabled(settings.graphics.performance_log);
+        if (self.settings.graphics.quality == GraphicsQuality::Cinematic)
+            != (settings.graphics.quality == GraphicsQuality::Cinematic)
+            || self.settings.graphics.floor_reflections != settings.graphics.floor_reflections
+        {
+            self.scene_targets = create_scene_targets(
+                &self.device,
+                &self.postprocess_texture_layout,
+                self.config.format,
+                self.config.width,
+                self.config.height,
+                settings.graphics.quality == GraphicsQuality::Cinematic,
+                settings.graphics.floor_reflections,
+            );
+        }
         self.settings = settings.clone();
         if !self.settings.behaviour.orbit_enabled {
             self.orbit_target = 0.0;
@@ -1295,6 +1602,8 @@ impl Renderer {
             self.config.format,
             width,
             height,
+            self.settings.graphics.quality == GraphicsQuality::Cinematic,
+            self.settings.graphics.floor_reflections,
         );
         self.recalculate_layout();
     }
@@ -1561,6 +1870,7 @@ impl Renderer {
             LightningOptions {
                 load: system_load,
                 max_arcs: quality.lightning_arcs(),
+                filaments: quality == GraphicsQuality::Cinematic,
                 segments: quality.lightning_segments(),
             }
         } else {
@@ -1585,6 +1895,28 @@ impl Renderer {
                 },
             },
             &mut self.render_objects,
+        );
+        self.tower_body_instances.clear();
+        if quality == GraphicsQuality::Cinematic {
+            self.tower_body_instances.extend(
+                self.render_objects
+                    .iter()
+                    .filter(|object| object.kind == RenderKind::Tower)
+                    .copied()
+                    .map(to_instance),
+            );
+            if !self.tower_body_instances.is_empty() {
+                self.queue.write_buffer(
+                    &self.tower_body_instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.tower_body_instances),
+                );
+            }
+        }
+        self.lightning_glow.update(
+            &self.render_objects,
+            now,
+            quality == GraphicsQuality::Cinematic && self.settings.graphics.system_lightning,
         );
         let instance_count = self.render_objects.len() + 1;
         self.instances.clear();
@@ -1620,6 +1952,14 @@ impl Renderer {
             bytemuck::cast_slice(&self.instances),
         );
         let scene_cpu = scene_started.elapsed();
+        let (departure, destination, arrival) = scene.cinematic_journey(now);
+        let (mut activity_positions, activity_events) = scene.glass_activity_uniforms(now);
+        let activity_budget = match quality {
+            GraphicsQuality::Performance => 2,
+            GraphicsQuality::Balanced => 4,
+            GraphicsQuality::High | GraphicsQuality::Cinematic => 8,
+        };
+        activity_positions[activity_budget..].fill([0.0; 4]);
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             camera_time: [eye.x, eye.y, eye.z, self.started.elapsed().as_secs_f32()],
@@ -1631,6 +1971,30 @@ impl Renderer {
                     VisualStyle::Classic => 0.0,
                     VisualStyle::Movie1995 => 1.0,
                 },
+            ],
+            cinematic: [
+                f32::from(
+                    quality == GraphicsQuality::Cinematic
+                        && self.settings.graphics.floor_reflections,
+                ),
+                arrival,
+                scene.flight_progress(now),
+                self.settings.graphics.motion_scale,
+            ],
+            destination: [destination.x, destination.y, destination.z, 0.0],
+            departure: [departure.x, departure.y, departure.z, 0.0],
+            route_controls: scene.flight_controls(),
+            visual_bounds: visualiser.normalized(self.config.width, self.config.height),
+            lightning_positions: self.lightning_glow.positions,
+            lightning_colors: self.lightning_glow.colors,
+            activity_positions,
+            activity_events,
+            activity_rows: scene.glass_activity_rows(now, &navigator.visible_file_ids),
+            navigator_metrics: [
+                NAVIGATOR_TEXTURE_TOP / NAVIGATOR_TEXTURE_HEIGHT as f32,
+                17.0 * NAVIGATOR_TEXTURE_SCALE / NAVIGATOR_TEXTURE_HEIGHT as f32,
+                NAVIGATOR_TEXTURE_LEFT / NAVIGATOR_TEXTURE_WIDTH as f32,
+                1.0 / NAVIGATOR_TEXTURE_WIDTH as f32,
             ],
             primary: OmarchyTheme::rgba(self.theme.accent, 1.0),
             secondary: OmarchyTheme::rgba(self.theme.cyan, 1.0),
@@ -1760,6 +2124,7 @@ impl Renderer {
             glass_instance_count,
             self.ui_rects.len(),
             visualiser,
+            arrival >= 0.0 || flight_intensity > 0.0,
         )?;
         self.performance.record(
             frame_started.elapsed(),
@@ -2049,6 +2414,7 @@ impl Renderer {
         glass_instance_count: usize,
         ui_rect_count: usize,
         visualiser: Rect,
+        floor_journey_active: bool,
     ) -> anyhow::Result<()> {
         let view = frame
             .texture
@@ -2114,22 +2480,129 @@ impl Renderer {
             )?;
         }
         let movie_glass = self.settings.appearance.visual_style == VisualStyle::Movie1995;
+        let cinematic = self.settings.graphics.quality == GraphicsQuality::Cinematic;
+        let composition_target = if cinematic {
+            &self.scene_targets.composite_view
+        } else {
+            &view
+        };
         let (scissor_x, scissor_y, scissor_width, scissor_height) = scissor_rect(visualiser);
-        let blur_scissor = (
-            scissor_x / 2,
-            scissor_y / 2,
-            scissor_width.div_ceil(2),
-            scissor_height.div_ceil(2),
+        let blur_scissor = padded_scaled_scissor(
+            visualiser,
+            self.config.width,
+            self.config.height,
+            self.scene_targets.blur_a_view.texture().width(),
+            self.scene_targets.blur_a_view.texture().height(),
+            10,
         );
-        let scene_target = if movie_glass {
+        if cinematic && self.settings.graphics.floor_reflections {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mirrored city pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.scene_targets.reflection_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.scene_targets.reflection_depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(11)),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                // Scale against actual target size; odd window dimensions still align.
+                let rx = self.scene_targets.reflection_view.texture().width() as f32
+                    / self.config.width as f32;
+                let ry = self.scene_targets.reflection_view.texture().height() as f32
+                    / self.config.height as f32;
+                pass.set_viewport(
+                    visualiser.x * rx,
+                    visualiser.y * ry,
+                    visualiser.width * rx,
+                    visualiser.height * ry,
+                    0.0,
+                    1.0,
+                );
+                pass.set_pipeline(&self.reflection_pipeline);
+                pass.set_bind_group(0, &self.uniform_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.tower_body_instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(
+                    0..self.index_count,
+                    0,
+                    0..self.tower_body_instances.len() as u32,
+                );
+            }
+            for (index, (target, pipeline, source)) in [
+                (
+                    &self.scene_targets.reflection_a_view,
+                    &self.reflection_horizontal_pipeline,
+                    &self.scene_targets.reflection_group,
+                ),
+                (
+                    &self.scene_targets.reflection_b_view,
+                    &self.reflection_vertical_pipeline,
+                    &self.scene_targets.reflection_a_group,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("reflection roughness pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(12 + index)),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, source, &[]);
+                let bounds = padded_scaled_scissor(
+                    visualiser,
+                    self.config.width,
+                    self.config.height,
+                    target.texture().width(),
+                    target.texture().height(),
+                    10,
+                );
+                pass.set_scissor_rect(bounds.0, bounds.1, bounds.2, bounds.3);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        let scene_target = if movie_glass || cinematic {
             &self.scene_targets.color_view
         } else {
             &view
         };
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("opaque scene pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            let attachments = [
+                Some(wgpu::RenderPassColorAttachment {
                     view: scene_target,
                     depth_slice: None,
                     resolve_target: None,
@@ -2142,12 +2615,25 @@ impl Renderer {
                         }),
                         store: wgpu::StoreOp::Store,
                     },
-                })],
+                }),
+                cinematic.then_some(wgpu::RenderPassColorAttachment {
+                    view: &self.scene_targets.glow_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("opaque scene pass"),
+                color_attachments: &attachments[..if cinematic { 2 } else { 1 }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: if movie_glass {
+                        store: if movie_glass || cinematic {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -2162,7 +2648,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.background_pipeline);
+            pass.set_pipeline(if cinematic {
+                &self.cinematic_background_pipeline
+            } else {
+                &self.background_pipeline
+            });
             pass.set_bind_group(0, &self.background_texture_group, &[]);
             pass.draw(0..3, 0..1);
             pass.set_viewport(
@@ -2174,15 +2664,20 @@ impl Renderer {
                 1.0,
             );
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if cinematic {
+                &self.cinematic_pipeline
+            } else {
+                &self.pipeline
+            });
             pass.set_bind_group(0, &self.uniform_group, &[]);
             pass.set_bind_group(1, &self.navigator_texture_group, &[]);
             pass.set_bind_group(2, &self.scene_targets.blur_b_group, &[]);
+            pass.set_bind_group(3, &self.scene_targets.reflection_b_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..self.index_count, 0, 0..opaque_instance_count as u32);
-            if !self.tower_label_instances.is_empty() {
+            if !cinematic && !self.tower_label_instances.is_empty() {
                 pass.set_pipeline(&self.tower_label_pipeline);
                 pass.set_bind_group(0, &self.uniform_group, &[]);
                 pass.set_bind_group(1, &self.tower_label_texture_group, &[]);
@@ -2237,7 +2732,7 @@ impl Renderer {
                 );
                 pass.draw(0..3, 0..1);
             }
-            if self.config.usage.contains(wgpu::TextureUsages::COPY_DST) {
+            if !cinematic && self.config.usage.contains(wgpu::TextureUsages::COPY_DST) {
                 if let Some(profile) = &mut self.gpu_profile {
                     profile.copy_timestamp(&mut encoder, false);
                 }
@@ -2253,7 +2748,7 @@ impl Renderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene copy pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view: composition_target,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -2273,22 +2768,38 @@ impl Renderer {
                 pass.set_bind_group(0, &self.scene_targets.color_group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("glass composite pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+            let attachments = [
+                Some(wgpu::RenderPassColorAttachment {
+                    view: composition_target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
-                })],
+                }),
+                cinematic.then_some(wgpu::RenderPassColorAttachment {
+                    view: &self.scene_targets.glow_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("glass composite pass"),
+                color_attachments: &attachments[..if cinematic { 2 } else { 1 }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard,
+                        store: if cinematic {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                     stencil_ops: None,
                 }),
@@ -2309,10 +2820,15 @@ impl Renderer {
             );
             pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
             if glass_instance_count > 0 {
-                pass.set_pipeline(&self.glass_pipeline);
+                pass.set_pipeline(if cinematic {
+                    &self.cinematic_glass_pipeline
+                } else {
+                    &self.glass_pipeline
+                });
                 pass.set_bind_group(0, &self.uniform_group, &[]);
                 pass.set_bind_group(1, &self.navigator_texture_group, &[]);
                 pass.set_bind_group(2, &self.scene_targets.blur_b_group, &[]);
+                pass.set_bind_group(3, &self.scene_targets.reflection_b_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -2322,6 +2838,208 @@ impl Renderer {
                     opaque_instance_count as u32
                         ..(opaque_instance_count + glass_instance_count) as u32,
                 );
+            }
+        }
+        if cinematic && floor_journey_active {
+            // Use separate depth so glass and text retain their existing transparency.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("arrival tower occlusion"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.scene_targets.journey_depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(14)),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_viewport(
+                    visualiser.x,
+                    visualiser.y,
+                    visualiser.width,
+                    visualiser.height,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+                pass.set_pipeline(&self.journey_depth_pipeline);
+                pass.set_bind_group(0, &self.uniform_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.tower_body_instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(
+                    0..self.index_count,
+                    0,
+                    0..self.tower_body_instances.len() as u32,
+                );
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("occluded floor journey"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: if movie_glass {
+                            composition_target
+                        } else {
+                            &self.scene_targets.color_view
+                        },
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.scene_targets.glow_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.scene_targets.journey_depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(15)),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(
+                visualiser.x,
+                visualiser.y,
+                visualiser.width,
+                visualiser.height,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+            pass.set_pipeline(&self.floor_journey_pipeline);
+            pass.set_bind_group(0, &self.uniform_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+        if cinematic {
+            for (index, (target, pipeline, source)) in [
+                (
+                    &self.scene_targets.bloom_a_view,
+                    &self.bloom_horizontal_pipeline,
+                    &self.scene_targets.glow_group,
+                ),
+                (
+                    &self.scene_targets.bloom_b_view,
+                    &self.bloom_vertical_pipeline,
+                    &self.scene_targets.bloom_a_group,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("cinematic bloom blur"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: self
+                        .gpu_profile
+                        .as_mut()
+                        .and_then(|profile| profile.writes(8 + index)),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, source, &[]);
+                let bounds = padded_scaled_scissor(
+                    visualiser,
+                    self.config.width,
+                    self.config.height,
+                    target.texture().width(),
+                    target.texture().height(),
+                    10,
+                );
+                pass.set_scissor_rect(bounds.0, bounds.1, bounds.2, bounds.3);
+                pass.draw(0..3, 0..1);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cinematic composite and sharp labels"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self
+                    .gpu_profile
+                    .as_mut()
+                    .and_then(|profile| profile.writes(10)),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.bloom_composite_pipeline);
+            pass.set_bind_group(
+                0,
+                if movie_glass {
+                    &self.scene_targets.composite_group
+                } else {
+                    &self.scene_targets.color_group
+                },
+                &[],
+            );
+            pass.set_bind_group(1, &self.scene_targets.bloom_b_group, &[]);
+            pass.set_bind_group(2, &self.uniform_group, &[]);
+            pass.draw(0..3, 0..1);
+            if !self.tower_label_instances.is_empty() {
+                pass.set_viewport(
+                    visualiser.x,
+                    visualiser.y,
+                    visualiser.width,
+                    visualiser.height,
+                    0.0,
+                    1.0,
+                );
+                pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+                pass.set_pipeline(&self.tower_label_pipeline);
+                pass.set_bind_group(0, &self.uniform_group, &[]);
+                pass.set_bind_group(1, &self.tower_label_texture_group, &[]);
+                pass.set_vertex_buffer(0, self.tower_label_instance_buffer.slice(..));
+                pass.draw(0..6, 0..self.tower_label_instances.len() as u32);
             }
         }
         {
@@ -2812,12 +3530,92 @@ fn create_tower_label_texture(
     (view, group)
 }
 
+fn create_floor_journey_pipelines(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    uniform_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("floor journey layout"),
+        bind_group_layouts: &[Some(uniform_layout)],
+        immediate_size: 0,
+    });
+    let additive = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    let targets = [
+        Some(wgpu::ColorTargetState {
+            format,
+            blend: Some(additive),
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba16Float,
+            blend: Some(additive),
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+    ];
+    let pipeline = |depth_only| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(if depth_only {
+                "arrival tower depth"
+            } else {
+                "floor journey"
+            }),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(Vertex::layout()), Some(InstanceRaw::layout())],
+            },
+            fragment: if depth_only {
+                None
+            } else {
+                Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_floor_journey"),
+                    compilation_options: Default::default(),
+                    targets: &targets,
+                })
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(depth_only),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    (pipeline(true), pipeline(false))
+}
+
 fn create_scene_targets(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
+    cinematic: bool,
+    reflections: bool,
 ) -> SceneTargets {
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("glass blur sampler"),
@@ -2828,7 +3626,7 @@ fn create_scene_targets(
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    let create_target = |label: &'static str, width: u32, height: u32| {
+    let create_target = |label: &'static str, width: u32, height: u32, format| {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -2862,14 +3660,76 @@ fn create_scene_targets(
         });
         (view, group)
     };
-    let (color_view, color_group) = create_target("opaque scene texture", width, height);
+    let (color_view, color_group) = create_target("opaque scene texture", width, height, format);
     let blur_width = width.div_ceil(2);
     let blur_height = height.div_ceil(2);
-    let (blur_a_view, blur_a_group) =
-        create_target("horizontal glass blur texture", blur_width, blur_height);
-    let (blur_b_view, blur_b_group) =
-        create_target("vertical glass blur texture", blur_width, blur_height);
+    let (blur_a_view, blur_a_group) = create_target(
+        "horizontal glass blur texture",
+        blur_width,
+        blur_height,
+        format,
+    );
+    let (blur_b_view, blur_b_group) = create_target(
+        "vertical glass blur texture",
+        blur_width,
+        blur_height,
+        format,
+    );
+    // Tiny placeholders avoid paying for Cinematic render targets in other presets.
+    // Reallocate when the quality changes, just as we do on resize.
+    let (width, height, blur_width, blur_height) = if cinematic {
+        (width, height, blur_width, blur_height)
+    } else {
+        (1, 1, 1, 1)
+    };
+    let (composite_view, composite_group) =
+        create_target("cinematic scene composite", width, height, format);
+    let (glow_view, glow_group) = create_target(
+        "cinematic emission",
+        width,
+        height,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    let (bloom_a_view, bloom_a_group) = create_target(
+        "bloom horizontal",
+        blur_width,
+        blur_height,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    let (bloom_b_view, bloom_b_group) = create_target(
+        "bloom vertical",
+        blur_width,
+        blur_height,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    let (rw, rh) = if cinematic && reflections {
+        (blur_width, blur_height)
+    } else {
+        (1, 1)
+    };
+    let (reflection_view, reflection_group) = create_target("mirrored city", rw, rh, format);
+    let (reflection_a_view, reflection_a_group) =
+        create_target("reflection blur horizontal", rw, rh, format);
+    let (reflection_b_view, reflection_b_group) =
+        create_target("reflection blur vertical", rw, rh, format);
+    let reflection_depth = create_depth_view(device, rw, rh);
     SceneTargets {
+        journey_depth: create_depth_view(device, width, height),
+        reflection_view,
+        reflection_group,
+        reflection_a_view,
+        reflection_a_group,
+        reflection_b_view,
+        reflection_b_group,
+        reflection_depth,
+        composite_view,
+        composite_group,
+        glow_view,
+        glow_group,
+        bloom_a_view,
+        bloom_a_group,
+        bloom_b_view,
+        bloom_b_group,
         color_view,
         color_group,
         blur_a_view,
@@ -3056,6 +3916,35 @@ fn expand_rect(rect: Rect, amount: f32) -> Rect {
 
 fn normalized_optional(rect: Option<Rect>, width: u32, height: u32) -> [f32; 4] {
     rect.map_or([0.0; 4], |rect| rect.normalized(width, height))
+}
+
+// Postprocessing only needs the visualiser plus its filter footprint. Use
+// actual target ratios so odd dimensions and split panes do not lose a pixel.
+fn padded_scaled_scissor(
+    rect: Rect,
+    width: u32,
+    height: u32,
+    target_width: u32,
+    target_height: u32,
+    padding: u32,
+) -> (u32, u32, u32, u32) {
+    let sx = target_width as f32 / width.max(1) as f32;
+    let sy = target_height as f32 / height.max(1) as f32;
+    let left = (rect.x * sx).floor().max(0.0) as u32;
+    let top = (rect.y * sy).floor().max(0.0) as u32;
+    let right = ((rect.x + rect.width) * sx).ceil().max(0.0) as u32;
+    let bottom = ((rect.y + rect.height) * sy).ceil().max(0.0) as u32;
+    let left = left.saturating_sub(padding).min(target_width - 1);
+    let top = top.saturating_sub(padding).min(target_height - 1);
+    let right = right
+        .saturating_add(padding)
+        .min(target_width)
+        .max(left + 1);
+    let bottom = bottom
+        .saturating_add(padding)
+        .min(target_height)
+        .max(top + 1);
+    (left, top, right - left, bottom - top)
 }
 
 fn scissor_rect(rect: Rect) -> (u32, u32, u32, u32) {
@@ -3618,6 +4507,315 @@ mod renderer_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a graphics adapter; run explicitly to validate arrival occlusion"]
+    fn floor_journey_is_occluded_on_gpu() {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .unwrap();
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("arrival test shader"),
+                source: wgpu::ShaderSource::Wgsl(SCENE_SHADER.into()),
+            });
+            let uniform_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+            let (depth_pipeline, arrival_pipeline) = create_floor_journey_pipelines(
+                &device,
+                &shader,
+                &uniform_layout,
+                wgpu::TextureFormat::Rgba8Unorm,
+            );
+            let eye = Vec3::new(0.0, 4.0, 8.0);
+            let view_proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0)
+                * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+            let uniforms = Uniforms {
+                view_proj: view_proj.to_cols_array_2d(),
+                camera_time: [eye.x, eye.y, eye.z, 0.0],
+                primary: [0.0, 1.0, 1.0, 1.0],
+                pulse: [0.0, 0.0, 1.0, 1.0],
+                cinematic: [0.0, 0.2, 1.0, 1.0],
+                ..Uniforms::zeroed()
+            };
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+            let (vertices, indices) = cube_mesh();
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let instances = [
+                InstanceRaw {
+                    model: Mat4::from_scale_rotation_translation(
+                        Vec3::new(20.0, 0.02, 20.0),
+                        Quat::IDENTITY,
+                        Vec3::new(0.0, -0.42, 0.0),
+                    )
+                    .to_cols_array_2d(),
+                    color: [0.0; 4],
+                },
+                InstanceRaw {
+                    model: Mat4::from_scale_rotation_translation(
+                        Vec3::splat(2.0),
+                        Quat::IDENTITY,
+                        Vec3::Y,
+                    )
+                    .to_cols_array_2d(),
+                    color: [0.0, 0.8, 1.0, 0.18],
+                },
+            ];
+            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let target = |format| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: 256,
+                        height: 256,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let color = target(wgpu::TextureFormat::Rgba8Unorm);
+            let color_view = color.create_view(&Default::default());
+            let glow = target(wgpu::TextureFormat::Rgba16Float);
+            let glow_view = glow.create_view(&Default::default());
+            let depth = create_depth_view(&device, 256, 256);
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 * 256 * 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let render = |occlude| {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    if occlude {
+                        pass.set_pipeline(&depth_pipeline);
+                        pass.set_bind_group(0, &group, &[]);
+                        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                        pass.draw_indexed(0..indices.len() as u32, 0, 1..2);
+                    }
+                }
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: &color_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            }),
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: &glow_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            }),
+                        ],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&arrival_pipeline);
+                    pass.set_bind_group(0, &group, &[]);
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                }
+                encoder.copy_texture_to_buffer(
+                    color.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(1024),
+                            rows_per_image: Some(256),
+                        },
+                    },
+                    color.size(),
+                );
+                queue.submit([encoder.finish()]);
+                let (tx, rx) = std::sync::mpsc::channel();
+                readback.map_async(wgpu::MapMode::Read, .., move |result| {
+                    tx.send(result).unwrap();
+                });
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                rx.recv().unwrap().unwrap();
+                let pixels = readback.get_mapped_range(..).unwrap().to_vec();
+                readback.unmap();
+                pixels
+            };
+            let open = render(false);
+            let masked = render(true);
+            let pixel = |world: Vec3| {
+                let clip = view_proj * world.extend(1.0);
+                let ndc = clip.truncate() / clip.w;
+                let x = ((ndc.x * 0.5 + 0.5) * 256.0) as usize;
+                let y = ((0.5 - ndc.y * 0.5) * 256.0) as usize;
+                (y * 256 + x) * 4 + 1
+            };
+            // The far arc lies behind the glass tower. The near arc stays visible.
+            let behind = pixel(Vec3::new(0.0, -0.41, -2.8));
+            let in_front = pixel(Vec3::new(0.0, -0.41, 2.8));
+            assert!(open[behind] > 32, "the unoccluded far arc must be visible");
+            assert_eq!(masked[behind], 0, "glass towers must hide the far arc");
+            assert!(masked[in_front] > 32, "the near arc must remain visible");
+        });
+    }
+
+    #[test]
+    fn lightning_glow_ignores_decorations_decays_and_clears_when_disabled() {
+        let now = Instant::now();
+        let mut glow = LightningGlow::default();
+        let mut object = RenderObject {
+            kind: RenderKind::Decoration,
+            model: Mat4::IDENTITY,
+            color: [0.2, 0.8, 1.0, 8.0],
+        };
+        glow.update(&[object], now, true);
+        assert!(glow.positions.iter().all(|p| p[3] == 0.0));
+        object.kind = RenderKind::Lightning;
+        glow.update(&[object], now, true);
+        let peak = glow.positions[0][3];
+        assert!(peak > 0.0);
+        glow.update(&[], now + Duration::from_millis(100), true);
+        assert!(glow.positions[0][3] > 0.0 && glow.positions[0][3] < peak);
+        glow.update(&[], now + Duration::from_secs(1), true);
+        assert!(glow.positions[0][3] < 0.001);
+        glow.update(&[object], now + Duration::from_secs(2), false);
+        assert!(glow.positions.iter().all(|p| p[3] == 0.0));
+    }
+
+    #[test]
+    fn lightning_glow_merges_segments_and_stays_bounded() {
+        let now = Instant::now();
+        let objects: Vec<_> = (0..100)
+            .map(|i| RenderObject {
+                kind: RenderKind::Lightning,
+                model: Mat4::from_translation(Vec3::new(
+                    (i / 10) as f32 * 5.4,
+                    (i % 10) as f32,
+                    0.0,
+                )),
+                color: [0.2, 0.8, 1.0, 8.0],
+            })
+            .collect();
+        let mut glow = LightningGlow::default();
+        glow.update(&objects[..10], now, true);
+        assert_eq!(glow.positions.iter().filter(|p| p[3] > 0.0).count(), 1);
+        glow.update(&objects, now, true);
+        assert_eq!(glow.positions.iter().filter(|p| p[3] > 0.0).count(), 4);
+        assert!(glow.positions.iter().flatten().all(|n| n.is_finite()));
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run explicitly to validate WGSL"]
+    fn cinematic_shaders_validate_on_gpu() {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .unwrap();
+            let (device, _) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap();
+            for (name, source) in [
+                ("scene", SCENE_SHADER),
+                ("background", include_str!("background.wgsl")),
+                ("blur", include_str!("blur.wgsl")),
+                ("bloom", BLOOM_SHADER),
+                ("tower labels", TOWER_LABEL_SHADER),
+            ] {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let _shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(name),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                assert!(scope.pop().await.is_none(), "invalid {name} shader");
+            }
+        });
+    }
+
+    #[test]
     fn terminal_row_updates_preserve_rich_text_and_remove_old_rows() {
         use crate::terminal::TerminalSpan;
 
@@ -3739,6 +4937,7 @@ mod renderer_tests {
     #[test]
     fn movie_glass_classification_does_not_capture_floor_or_ui_geometry() {
         let object = |alpha| RenderObject {
+            kind: RenderKind::Tower,
             model: Mat4::IDENTITY,
             color: [0.0, 0.5, 0.8, alpha],
         };
@@ -3956,3 +5155,7 @@ mod renderer_tests {
         assert_eq!(compact, "TTY // STANDBY // F2 FOCUS // F3 HIDE");
     }
 }
+
+#[cfg(test)]
+#[path = "blur_tests.rs"]
+mod blur_tests;

@@ -1,7 +1,7 @@
 use crossbeam_channel::{Receiver, bounded};
 use std::time::{Duration, Instant};
 
-const PASSES: [&str; 8] = [
+const PASSES: [&str; 16] = [
     "navigator",
     "labels",
     "opaque",
@@ -10,6 +10,14 @@ const PASSES: [&str; 8] = [
     "copy",
     "glass",
     "ui",
+    "bloom_x",
+    "bloom_y",
+    "bloom_composite",
+    "reflection",
+    "reflection_x",
+    "reflection_y",
+    "arrival_depth",
+    "arrival_floor",
 ];
 const BUFFER_SIZE: u64 = (PASSES.len() * 2 * size_of::<u64>()) as u64;
 
