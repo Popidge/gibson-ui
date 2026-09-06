@@ -4,6 +4,21 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-06
+
+- Added Cinematic bloom, atmospheric haze, polished floor reflections, and richer glass materials.
+- Added fine lightning branches, restrained surface illumination, and a fading afterglow under system load.
+- Added a curved navigation light wake, destination illumination, and a tower arrival sweep.
+- Made towers occlude arrival effects on the floor, including behind translucent glass.
+- Matched flight sound panning to camera banking and added a smooth arrival accent.
+- Added glass-city effects for file creation, modification, renaming, and removal.
+- Added front-edge activity pulses and markers beside affected visible file rows.
+- Grouped bursts of filesystem activity and added a five-second residual glow.
+- Added view-dependent bevel glints and retained lower-cost graphics presets.
+- Reduced bloom and reflection blur work without reducing effect resolution.
+- Removed repeated activity allocations and shared shader uniform definitions.
+- Added GPU pixel-comparison tests and documented the performance measurements.
+
 ## 0.3.1 - 2026-09-05
 
 - Reduced terminal reshaping, navigator snapshot work, and repeated text preparation.

@@ -238,7 +238,27 @@ The default `high` setting targets 60 frames per second on a six-year-old Radeon
 
 GIBSON caches tower-label textures and uses stable tower identifiers in the render loop.
 
-Use `balanced` or `performance` for more GPU headroom. Use `cinematic` for more objects and labels.
+Use `balanced` or `performance` for more GPU headroom. The `high` preset keeps the original scene appearance.
+
+The `cinematic` preset adds bloom, atmospheric haze, floor reflections, and light effects during directory arrivals.
+The 1995 Film style also adds clear, smoked, and etched glass with layered detail and bright edges.
+Lightning adds fine branches and briefly illuminates nearby surfaces.
+Tower labels, navigator text, wallpaper, and terminal text do not emit bloom.
+A motion setting of zero disables arrival animation, glass shimmer, and glass activity effects.
+
+In 1995 Film style, filesystem changes illuminate the current tower.
+Creation sends light upward. Saves produce ripples. Renames move a light band. Removal sends a fading band downward.
+Repeated changes merge into event groups. Performance shows up to two groups; Balanced shows four; High and Cinematic show eight.
+Recent activity leaves a faint glow for five seconds, including when you fly away from that tower.
+The watcher monitors the current directory; these effects do not represent background activity across the entire filesystem.
+Cinematic also adds faint bevel glints that follow the viewing angle.
+The navigator face carries activity along both vertical edges, with a small marker beside the affected visible file row for each event group.
+Removed and offscreen files use the edge effect without a row marker.
+
+Press `F10` to select `CINEMATIC` under `GRAPHICS QUALITY`.
+Select `1995 FILM` under `VISUAL STYLE` to see the glass effects.
+Toggle `FLOOR REFLECTIONS` to compare the polished floor with reflections disabled. This setting only affects Cinematic.
+The reflection pass draws simplified towers at half resolution. It excludes labels, navigator panels, and decorative geometry.
 
 The HUD shows the frame rate and the main controls.
 

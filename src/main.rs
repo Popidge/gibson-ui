@@ -347,7 +347,12 @@ impl App {
         }
         let flying = self.visual_state() == VisualState::Transit;
         if let Some(soundscape) = &mut self.soundscape {
-            soundscape.update(flying);
+            let now = Instant::now();
+            soundscape.update(
+                flying,
+                self.scene.camera_roll(now),
+                self.scene.flight_intensity(now),
+            );
         }
     }
 

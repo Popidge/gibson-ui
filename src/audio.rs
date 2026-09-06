@@ -60,10 +60,13 @@ pub struct Soundscape {
     manager: AudioManager<DefaultBackend>,
     music: StreamingSoundHandle<FromFileError>,
     ui_sweep: StaticSoundData,
+    arrival: StaticSoundData,
     flight: FlightSounds,
     ui_handle: Option<StaticSoundHandle>,
     flight_handle: Option<StaticSoundHandle>,
     flying: bool,
+    flight_volume: f32,
+    arrival_handle: Option<StaticSoundHandle>,
     focused: bool,
     enabled: bool,
     music_paused: bool,
@@ -75,6 +78,7 @@ pub struct Soundscape {
 impl Soundscape {
     pub fn new() -> anyhow::Result<Self> {
         let ui_sweep = decode_static(UI_SWEEP).context("decode UI sweep")?;
+        let arrival = prepare_arrival(&ui_sweep);
         let flight = FlightSounds {
             short: decode_static(FLIGHT_SHORT).context("decode short flight cue")?,
             medium_a: decode_static(FLIGHT_MEDIUM_A).context("decode flight cue A")?,
@@ -98,10 +102,13 @@ impl Soundscape {
             manager,
             music,
             ui_sweep,
+            arrival,
             flight,
             ui_handle: None,
             flight_handle: None,
             flying: false,
+            flight_volume: -10.0,
+            arrival_handle: None,
             focused: true,
             enabled: true,
             music_paused: false,
@@ -141,6 +148,12 @@ impl Soundscape {
         if !self.enabled {
             return;
         }
+        if duration.is_zero() {
+            return;
+        }
+        if let Some(mut handle) = self.arrival_handle.take() {
+            handle.stop(tween(Duration::from_millis(80)));
+        }
         self.set_flying(true);
         if let Some(mut handle) = self.flight_handle.take() {
             handle.stop(tween(Duration::from_millis(80)));
@@ -162,7 +175,8 @@ impl Soundscape {
             (cue.duration().as_secs_f64() / duration.as_secs_f64().max(0.1)).clamp(0.78, 1.30)
                 * pitch
         };
-        let panning = [-0.12, 0.08, -0.04, 0.14][serial as usize % 4];
+        self.flight_volume = volume;
+        let panning = 0.0;
         let mut sound = cue
             .volume(volume)
             .playback_rate(playback_rate)
@@ -177,8 +191,26 @@ impl Soundscape {
         }
     }
 
-    pub fn update(&mut self, flying: bool) {
+    pub fn update(&mut self, flying: bool, roll: f32, intensity: f32) {
+        if self.flying && !flying && self.enabled && self.focused {
+            // Reuse the established sonic palette for a quiet landing accent.
+            let cue = self.arrival.clone();
+            match self.manager.play(cue) {
+                Ok(handle) => self.arrival_handle = Some(handle),
+                Err(error) => warn!(%error, "cannot play arrival sound"),
+            }
+        }
         self.set_flying(flying);
+        if flying && let Some(handle) = &mut self.flight_handle {
+            handle.set_panning(
+                (roll * 2.0).clamp(-0.22, 0.22),
+                tween(Duration::from_millis(70)),
+            );
+            handle.set_volume(
+                self.flight_volume - 3.0 * (1.0 - intensity.clamp(0.0, 1.0)),
+                tween(Duration::from_millis(70)),
+            );
+        }
         if self.last_health_check.elapsed() >= Duration::from_secs(2) {
             if let Some(error) = self.music.pop_error() {
                 warn!(%error, "suspense music decoder failed");
@@ -208,6 +240,9 @@ impl Soundscape {
             0.65
         };
         if !enabled {
+            if let Some(mut handle) = self.arrival_handle.take() {
+                handle.stop(tween(Duration::from_millis(80)));
+            }
             if let Some(mut handle) = self.ui_handle.take() {
                 handle.stop(tween(Duration::from_millis(80)));
             }
@@ -256,6 +291,27 @@ impl Soundscape {
     }
 }
 
+// Bake both fades into the short clip: an immediately scheduled stop would
+// replace Kira's playback fade-in while its gain is still silence.
+fn prepare_arrival(source: &StaticSoundData) -> StaticSoundData {
+    let mut cue = source.slice(0.0..0.36);
+    let frames: Vec<_> = (0..cue.num_frames())
+        .map(|index| {
+            let mut frame = cue.frame_at_index(index).unwrap();
+            let seconds = index as f32 / cue.sample_rate as f32 / 0.82;
+            let fade_in = (seconds / 0.02).clamp(0.0, 1.0);
+            let fade_out = ((0.4 - seconds) / 0.15).clamp(0.0, 1.0);
+            let gain = fade_in * fade_out;
+            frame.left *= gain;
+            frame.right *= gain;
+            frame
+        })
+        .collect();
+    cue.frames = frames.into();
+    cue.slice = None;
+    cue.volume(-14.0).playback_rate(0.82).panning(0.0)
+}
+
 fn decode_static(bytes: &'static [u8]) -> Result<StaticSoundData, FromFileError> {
     StaticSoundData::from_cursor(Cursor::new(bytes))
 }
@@ -285,6 +341,21 @@ fn tween(duration: Duration) -> Tween {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrival_clip_has_audible_body_and_silent_boundaries() {
+        for asset in [
+            UI_SWEEP,
+            include_bytes!("../assets/sounds/fallback/ui-sweep.ogg").as_slice(),
+        ] {
+            let cue = prepare_arrival(&decode_static(asset).unwrap());
+            assert!(cue.settings.fade_in_tween.is_none());
+            let energy = |frame: &kira::Frame| frame.left.abs() + frame.right.abs();
+            assert_eq!(energy(cue.frames.first().unwrap()), 0.0);
+            assert_eq!(energy(cue.frames.last().unwrap()), 0.0);
+            assert!(cue.frames.iter().map(energy).fold(0.0_f32, f32::max) > 0.01);
+        }
+    }
 
     #[test]
     #[ignore = "requires a live audio output device"]

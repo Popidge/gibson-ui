@@ -173,6 +173,7 @@ pub struct GraphicsSettings {
     pub quality: GraphicsQuality,
     pub frame_rate: FrameRate,
     pub floor_pulses: bool,
+    pub floor_reflections: bool,
     pub system_lightning: bool,
     pub scanlines: bool,
     pub motion_scale: f32,
@@ -185,6 +186,7 @@ impl Default for GraphicsSettings {
             quality: GraphicsQuality::High,
             frame_rate: FrameRate::Fps60,
             floor_pulses: true,
+            floor_reflections: true,
             system_lightning: true,
             scanlines: true,
             motion_scale: 1.0,
@@ -314,6 +316,7 @@ enum SettingItem {
     GraphicsQuality,
     FrameRate,
     FloorPulses,
+    FloorReflections,
     SystemLightning,
     Scanlines,
     Motion,
@@ -325,13 +328,14 @@ enum SettingItem {
 }
 
 impl SettingsMenu {
-    const OMARCHY_ITEMS: [SettingItem; 14] = [
+    const OMARCHY_ITEMS: [SettingItem; 15] = [
         SettingItem::FollowOmarchy,
         SettingItem::Backdrop,
         SettingItem::VisualStyle,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
+        SettingItem::FloorReflections,
         SettingItem::SystemLightning,
         SettingItem::Scanlines,
         SettingItem::Motion,
@@ -341,12 +345,13 @@ impl SettingsMenu {
         SettingItem::Audio,
         SettingItem::AudioVolume,
     ];
-    const PORTABLE_ITEMS: [SettingItem; 13] = [
+    const PORTABLE_ITEMS: [SettingItem; 14] = [
         SettingItem::Backdrop,
         SettingItem::VisualStyle,
         SettingItem::GraphicsQuality,
         SettingItem::FrameRate,
         SettingItem::FloorPulses,
+        SettingItem::FloorReflections,
         SettingItem::SystemLightning,
         SettingItem::Scanlines,
         SettingItem::Motion,
@@ -416,6 +421,7 @@ impl SettingsMenu {
                     self.settings.graphics.frame_rate.adjust(direction)
             }
             SettingItem::FloorPulses => self.settings.graphics.floor_pulses ^= true,
+            SettingItem::FloorReflections => self.settings.graphics.floor_reflections ^= true,
             SettingItem::SystemLightning => self.settings.graphics.system_lightning ^= true,
             SettingItem::Scanlines => self.settings.graphics.scanlines ^= true,
             SettingItem::Motion => {
@@ -491,6 +497,17 @@ impl SettingsMenu {
                 "FLOOR PULSES",
                 on_off(self.settings.graphics.floor_pulses).to_owned(),
             ),
+            SettingItem::FloorReflections => (
+                "FLOOR REFLECTIONS",
+                if self.settings.graphics.quality == GraphicsQuality::Cinematic {
+                    on_off(self.settings.graphics.floor_reflections).to_owned()
+                } else {
+                    format!(
+                        "{} (CINEMATIC)",
+                        on_off(self.settings.graphics.floor_reflections)
+                    )
+                },
+            ),
             SettingItem::SystemLightning => (
                 "SYSTEM LIGHTNING",
                 on_off(self.settings.graphics.system_lightning).to_owned(),
@@ -560,6 +577,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn floor_reflections_default_on_and_can_be_saved_off() {
+        let old = toml::from_str::<Settings>("[graphics]\nquality = \"cinematic\"\n").unwrap();
+        assert!(old.graphics.floor_reflections);
+        let mut menu = SettingsMenu::new(old, true);
+        menu.move_selection(6);
+        assert!(menu.adjust(-1));
+        assert!(!menu.settings.graphics.floor_reflections);
+        let saved = toml::to_string(menu.settings()).unwrap();
+        let loaded: Settings = toml::from_str(&saved).unwrap();
+        assert!(!loaded.graphics.floor_reflections);
+        assert!(
+            menu.snapshot()
+                .text
+                .contains("▶ FLOOR REFLECTIONS      OFF")
+        );
+    }
+
+    #[test]
     fn invalid_numeric_values_return_to_safe_settings() {
         let mut settings = toml::from_str::<Settings>(
             "[graphics]\nmotion_scale = nan\n[audio]\nmaster_volume = 99.0\n",
@@ -582,7 +617,7 @@ mod tests {
     #[test]
     fn system_lightning_can_be_disabled() {
         let mut menu = SettingsMenu::new(Settings::default(), true);
-        menu.move_selection(6);
+        menu.move_selection(7);
 
         assert!(menu.adjust(1));
         assert!(!menu.settings.graphics.system_lightning);

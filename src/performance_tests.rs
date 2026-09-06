@@ -20,7 +20,7 @@ fn profile_hot_paths() {
     let mut scene = Scene::new(directory.path().to_owned());
     scene.update(directory.path().to_owned(), entries.clone(), &[]);
     let mut navigator = Navigator::new(directory.path().to_owned()).unwrap();
-    navigator.update(directory.path().to_owned(), entries);
+    navigator.update(directory.path().to_owned(), entries.clone());
     // Resolve asynchronous preview work before measuring steady-state snapshots.
     std::thread::sleep(Duration::from_millis(100));
     navigator.poll();
@@ -49,6 +49,26 @@ fn profile_hot_paths() {
     measure("scene_256", 20_000, || {
         scene.write_render_objects(black_box(context), &mut objects);
         black_box(&objects);
+    });
+    let movie_context = SceneRenderContext {
+        visual_style: VisualStyle::Movie1995,
+        lightning: LightningOptions {
+            load: 1.0,
+            max_arcs: 5,
+            segments: 11,
+            filaments: true,
+        },
+        ..context
+    };
+    measure("cinematic_lightning_256", 20_000, || {
+        scene.write_render_objects(black_box(movie_context), &mut objects);
+        black_box(&objects);
+    });
+    let mutations = vec![crate::filesystem::FileMutation::Modified(entries[0].clone()); 1000];
+    scene.update(directory.path().to_owned(), entries, &mutations);
+    let activity_time = Instant::now() + Duration::from_millis(400);
+    measure("activity_uniforms", 50_000, || {
+        black_box(scene.glass_activity_uniforms(activity_time));
     });
     measure("labels_256", 20_000, || {
         black_box(scene.tower_labels(

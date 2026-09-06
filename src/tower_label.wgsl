@@ -1,15 +1,3 @@
-struct Uniforms {
-    view_proj: mat4x4<f32>,
-    camera_time: vec4<f32>,
-    pulse: vec4<f32>,
-    primary: vec4<f32>,
-    secondary: vec4<f32>,
-    accent: vec4<f32>,
-    background: vec4<f32>,
-    active_face: vec4<f32>,
-    render_size: vec4<f32>,
-}
-
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
